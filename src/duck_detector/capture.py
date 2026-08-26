@@ -110,6 +110,7 @@ def capture(args: argparse.Namespace) -> Path:
     local_dir = Path(args.root) / session
 
     script = resources.files("duck_detector").joinpath("robot_capture.sh").read_text()
+    remote_script = f"/var/tmp/duck-capture-{stamp}.sh"
     # `framerate=2.0/1` is not a caps value GStreamer will negotiate, so the rate travels as a
     # fraction — which also buys `--hz 0.5`, one frame every two seconds, for a long slow walk.
     rate = Fraction(args.hz).limit_denominator(100)
@@ -131,17 +132,28 @@ def capture(args: argparse.Namespace) -> Path:
         print(f"would run on {args.host}:\n  env {exports} sh -s", file=sys.stderr)
         return local_dir
 
-    # No `-tt`: a tty would echo this script back into stdout and CRLF every line. An interrupt
-    # still reaches the robot — ssh dying hangs up the remote shell, and its EXIT trap is what puts
-    # mediad back.
-    result = subprocess.run(
-        ["ssh", args.host, f"env {exports} sh -s"],
+    # **The script goes over first, rather than down stdin.** It needs `sudo` to stop `mediad`, and
+    # a board without a NOPASSWD rule then has a password to ask for — which needs a terminal, the
+    # way the robot's own `dev-push.sh` and `provision-board.sh` ask for it. A script on stdin and
+    # an interactive prompt cannot both have one, so: copy, then run with `-t`.
+    # `cat` rather than `scp -`: scp has no stdin source, and this step wants no terminal — the
+    # script is the stdin, and nothing here calls sudo.
+    subprocess.run(
+        ["ssh", args.host, f"cat > {shlex.quote(remote_script)}"],
         input=script,
+        text=True,
+        check=True,
+    )
+    # `-t` for the prompt. stdout comes back with CRLF because of it, which is why the frame count
+    # is read as "the last line that is a number" below rather than "the last line".
+    result = subprocess.run(
+        ["ssh", "-t", args.host, f"env {exports} sh {remote_script}"],
         capture_output=True,
         text=True,
         check=False,
     )
     sys.stderr.write(result.stderr)
+    ssh(args.host, f"rm -f {shlex.quote(remote_script)}", check=False, quiet=True)
     if result.returncode != 0:
         raise SystemExit(f"capture failed on {args.host} ({result.returncode})")
     # The count is the last thing the script prints, but stdout is not ours alone — read the last

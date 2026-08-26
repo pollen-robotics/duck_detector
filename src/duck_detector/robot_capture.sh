@@ -36,10 +36,12 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 command -v gst-launch-1.0 >/dev/null 2>&1 \
     || die "no gst-launch-1.0 on this board. sudo /usr/local/sbin/robot-setup-gstreamer"
 
-# Checked before anything else, because the alternative is a password prompt on a connection with
-# no terminal: ssh would sit there until somebody noticed.
-sudo -n true 2>/dev/null \
-    || die "this needs passwordless sudo on the robot (systemctl stop mediad)"
+# `sudo` needs a terminal here, and the caller gives it one (`ssh -t`, as the robot's own scripts
+# do) — so a password prompt is a prompt rather than a hang. Said out loud all the same, because a
+# prompt appearing in the middle of a capture is a surprise otherwise.
+if ! sudo -n true 2>/dev/null; then
+    say "sudo will ask for your password (add a NOPASSWD rule for systemctl to capture unattended)"
+fi
 [ -e "$DEVICE" ] || die "$DEVICE does not exist — is the camera overlay active?"
 
 MEDIAD_WAS=""
@@ -50,14 +52,14 @@ fi
 restore() {
     if [ -n "$MEDIAD_WAS" ]; then
         say "starting mediad again"
-        sudo -n systemctl start mediad || say "WARNING: could not start mediad"
+        sudo systemctl start mediad || say "WARNING: could not start mediad"
     fi
 }
 trap restore EXIT INT TERM
 
 if [ -n "$MEDIAD_WAS" ]; then
     say "stopping mediad — V4L2 capture is exclusive and it holds $DEVICE"
-    sudo -n systemctl stop mediad
+    sudo systemctl stop mediad
     # The device does not free instantly on a pipeline teardown.
     i=0
     while [ "$i" -lt 20 ]; do
@@ -71,7 +73,7 @@ fi
 # The helper is what `scripts/setup-rkaiq.sh` installs; without it, capture still works from the
 # boot mode, only slower.
 if [ -x /usr/local/bin/rkaiq-pin-sensor-mode ]; then
-    sudo -n /usr/local/bin/rkaiq-pin-sensor-mode >/dev/null 2>&1 || true
+    sudo /usr/local/bin/rkaiq-pin-sensor-mode >/dev/null 2>&1 || true
 fi
 
 mkdir -p "$DIR"
