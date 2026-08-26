@@ -27,6 +27,8 @@ import torch
 from PIL import Image, ImageDraw
 from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
+from duck_detector.torchsetup import prepare_cuda
+
 # Small, fast, and good at natural phrases. The alternative measured here was OWLv2, which wants
 # noun phrases rather than descriptions and did worse on a robot it has never seen.
 MODEL = "IDEA-Research/grounding-dino-tiny"
@@ -48,36 +50,6 @@ NMS_IOU = 0.5
 # grounds to the whole scene, and one such box in a training set teaches the model that everything
 # is a duck.
 MAX_AREA = 0.45
-
-
-def pick_device() -> str:
-    """CUDA if it can actually run a convolution, and say so when it cannot.
-
-    On this machine the CUDA wheel ships cuDNN sublibraries that disagree with each other
-    (`CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH` out of the first conv, torch 2.13+cu130 against
-    cuDNN 9.20/9.22), and it is not the loader path — a scrubbed `LD_LIBRARY_PATH` fails the same
-    way. Convolutions run fine on CUDA *without* cuDNN, a little slower, so that is the fallback
-    rather than dropping to the CPU: probe once, and take the fast path where the wheel is healthy.
-    """
-    if not torch.cuda.is_available():
-        return "cpu"
-    probe = lambda: torch.nn.functional.conv2d(  # noqa: E731
-        torch.randn(1, 3, 32, 32, device="cuda"), torch.randn(4, 3, 3, 3, device="cuda")
-    )
-    try:
-        probe()
-        return "cuda"
-    except RuntimeError as e:
-        if "CUDNN" not in str(e).upper():
-            raise
-        torch.backends.cudnn.enabled = False
-        try:
-            probe()
-        except RuntimeError:
-            print("cuda cannot convolve at all; falling back to the cpu")
-            return "cpu"
-        print("cuda with cudnn disabled (the wheel's cudnn disagrees with itself)")
-        return "cuda"
 
 
 def load(device: str):
@@ -199,7 +171,7 @@ def main() -> None:
     out = args.out or Path("datasets/labelled") / args.session.name
     out.mkdir(parents=True, exist_ok=True)
 
-    device = pick_device()
+    device = prepare_cuda()
     print(f"{MODEL} on {device}: {len(frames)} frames, threshold {args.threshold}")
     processor, model = load(device)
 

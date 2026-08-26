@@ -31,12 +31,20 @@ label = [
     "torch>=2.5",
     "transformers>=4.46",
 ]
+# The correction pass. Its own extra because Label Studio is a Django application and a few hundred
+# megabytes of it, and nothing else here needs a web app.
+review = [
+    "label-studio>=1.13",
+]
 
 [project.scripts]
 # One command per stage of the pipeline in the README.
 capture = "duck_detector.capture:main"
 triage = "duck_detector.triage:main"
 autolabel = "duck_detector.autolabel:main"
+review = "duck_detector.review:main"
+dataset = "duck_detector.dataset:main"
+train = "duck_detector.train:main"
 
 [tool.ruff]
 src = ["src"]

@@ -25,7 +25,8 @@ keeps its 50 Hz control loop, on a camera mounted 20 cm off the floor behind a w
 | **capture** | pull stills from a robot's own camera, one session at a time | works |
 | **triage** | rank a session's frames, because most of them are blurred floor | works |
 | **label** | pre-label with an open-vocabulary detector, then correct by hand | works, needs the correction pass |
-| **train** | fine-tune a small detector, split by session | next |
+| **review** | correct those boxes in Label Studio, and get YOLO labels back | works |
+| **train** | fine-tune a small detector, split by session, export ONNX | works, needs data |
 | **export** | ONNX → RKNN, INT8, and measure it on the board | after that |
 
 ### capture
@@ -94,17 +95,57 @@ Two things learned the hard way, both in the code as comments:
 you find out the prompt is describing the sofa. The threshold stays low on purpose — a missing box
 costs more human time than a wrong one.
 
-### train — next
+### review
 
-A small YOLO (`yolo11n`/`yolov8n`) at 320×320, fine-tuned from COCO weights: one class, a few
-thousand frames, heavy augmentation on brightness and blur because the ISP and the shutter are what
-change most between rooms. Split by session, never by frame.
+```bash
+uv sync --extra review
+uv run review prepare datasets/raw/<session>   # tasks with the boxes already drawn
+uv run review serve                            # Label Studio, pointed at this repo
+#   … correct, then Export → JSON
+uv run review import <export>.json             # corrections back as YOLO labels
+```
+
+`serve` sets `LOCAL_FILES_SERVING_ENABLED` and the document root, and `prepare` writes tasks that
+point at `/data/local-files/?d=…` — so the frames load with nothing configured in the UI. The
+pre-labeller's boxes arrive as *predictions*, which is the difference between accepting a box and
+drawing one.
+
+A frame somebody opened and left empty is a negative and is kept. A frame nobody opened is skipped:
+"there is nothing here" and "nobody looked" are different, and only one of them is training data.
+
+### train
+
+```bash
+uv sync --extra train
+uv run dataset build          # or --smoke, for one session, plumbing only
+uv run train --export
+```
+
+`dataset build` **refuses to split a single session**, because splitting one by frame puts
+near-copies on both sides and the val score becomes memorisation. It holds out whole sessions, the
+newest by default, and symlinks rather than copies so the frames stay the one copy in `raw/`.
+
+`yolo11n` at 320×320 from COCO weights. The augmentation follows the camera rather than a
+photo set: ±12° of roll because the camera rolls with the gait, modest translation and scale because
+it is one camera at one height, no vertical flip because the daemon already turned the picture the
+right way up. The motion blur is left to the data — half of every session has it, which teaches
+better than a blur transform would.
+
+`--export` writes ONNX with static shapes at opset 12, which is what `rknn-toolkit2` will take.
 
 ### export — after that
 
-ONNX with static shapes and an opset `rknn-toolkit2` accepts, then INT8 quantisation with a
-calibration set drawn from the robot's own frames — the quantisation is where a detector that
-worked on the laptop stops working on the board, so it is measured there, not assumed.
+The ONNX exists; the RKNN conversion does not yet. INT8 with a calibration set drawn from the
+robot's own frames, then measured on the board — quantisation is where a detector that worked on the
+laptop stops working, so it is a measurement rather than an assumption.
+
+## One local wrinkle
+
+This machine's CUDA wheel (`torch 2.13+cu130`) ships cuDNN sublibraries that fail each other's
+version check, and it is not the loader path — a scrubbed `LD_LIBRARY_PATH` fails identically. Every
+tool here probes a convolution at startup and turns cuDNN off if that is what it takes, which costs
+a little speed and keeps everything working. A torch build whose cuDNN is consistent is the real
+fix, whenever somebody picks one.
 
 ## Layout
 

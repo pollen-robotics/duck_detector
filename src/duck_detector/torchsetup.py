@@ -1,0 +1,43 @@
+"""Make CUDA usable on a machine whose wheel disagrees with itself.
+
+`torch 2.13+cu130` here ships cuDNN sublibraries that fail each other's version check — the first
+convolution raises `CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH`, in this venv, from the wheel's own
+bundled libraries. It is **not** the loader path: a scrubbed `LD_LIBRARY_PATH` fails identically.
+
+Convolutions run fine on CUDA with cuDNN switched off, a little slower, so that is the fallback
+rather than dropping to the CPU. The real fix is a torch build whose cuDNN is consistent; until
+somebody picks one, this keeps every tool here working instead of making each of them discover the
+same stack trace.
+"""
+
+from __future__ import annotations
+
+
+def prepare_cuda(verbose: bool = True) -> str:
+    """The device to use, having proved it can convolve. `"cuda"` or `"cpu"`."""
+    import torch
+
+    if not torch.cuda.is_available():
+        return "cpu"
+
+    def probe() -> None:
+        torch.nn.functional.conv2d(
+            torch.randn(1, 3, 32, 32, device="cuda"), torch.randn(4, 3, 3, 3, device="cuda")
+        )
+
+    try:
+        probe()
+        return "cuda"
+    except RuntimeError as error:
+        if "CUDNN" not in str(error).upper():
+            raise
+        torch.backends.cudnn.enabled = False
+        try:
+            probe()
+        except RuntimeError:
+            if verbose:
+                print("cuda cannot convolve at all; falling back to the cpu")
+            return "cpu"
+        if verbose:
+            print("cuda with cudnn disabled (this wheel's cudnn disagrees with itself)")
+        return "cuda"
