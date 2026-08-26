@@ -213,6 +213,12 @@ def start_label_studio(port: int, creds: dict) -> subprocess.Popen:
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        # **Its own process group.** Ctrl-C in a terminal goes to every process in the foreground
+        # group, so without this Label Studio starts shutting down at the same moment we try to
+        # export the corrections out of it — which is what "Connection reset by peer" on the way
+        # out was. Now the interrupt reaches this process alone, and the child is stopped
+        # deliberately, after the export.
+        start_new_session=True,
     )
 
 
@@ -282,6 +288,30 @@ class Client:
         if "id" not in created:
             raise SystemExit(f"could not create the project: {str(created)[:300]}")
         return created["id"], 0
+
+    def ensure_local_storage(self, project: int, path: Path) -> None:
+        """Register the frames directory as a local storage, or the images do not load.
+
+        `LOCAL_FILES_SERVING_ENABLED` and a document root are necessary and **not sufficient**: in
+        1.23 `/data/local-files/` answers 404 until the file also belongs to a storage attached to
+        the project. The path has to be a *subdirectory* of the document root — pointing it at the
+        root itself is refused, in the one error message that explains any of this.
+
+        Registered, never synced: a sync would invent one task per file and lose the boxes that
+        were imported with ours.
+        """
+        listing = self._call("GET", f"/api/storages/localfiles?project={project}")
+        storages = listing if isinstance(listing, list) else listing.get("results", [])
+        wanted = str(path.resolve())
+        if any(storage.get("path") == wanted for storage in storages):
+            return
+        self._call(
+            "POST",
+            "/api/storages/localfiles",
+            json.dumps(
+                {"project": project, "path": wanted, "title": "frames", "use_blob_urls": False}
+            ).encode(),
+        )
 
     def import_tasks(self, project: int, tasks: Path) -> dict:
         return self._call("POST", f"/api/projects/{project}/import", tasks.read_bytes())
@@ -370,6 +400,7 @@ def run(session: Path, port: int, relabel: bool, open_browser: bool) -> None:
         client.wait()
         client.login(creds)
         project, existing = client.project(session.name)
+        client.ensure_local_storage(project, DATASETS / "raw")
         if existing:
             print(f"== project {project} already holds {existing} tasks; not importing again")
         else:
