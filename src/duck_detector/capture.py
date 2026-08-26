@@ -144,31 +144,30 @@ def capture(args: argparse.Namespace) -> Path:
         text=True,
         check=True,
     )
-    # `-t` for the prompt. stdout comes back with CRLF because of it, which is why the frame count
-    # is read as "the last line that is a number" below rather than "the last line".
+    # **Nothing is captured here, and that is the point.** `sudo` writes its prompt to the
+    # terminal ssh gave it; capturing that puts the prompt in a pipe, so the password is asked for
+    # somewhere nobody can see it and the capture hangs forever waiting to be told. This inherits
+    # the terminal instead — the prompt shows, the progress lines show, and Ctrl-C reaches the
+    # robot, whose trap puts `mediad` back.
     result = subprocess.run(
         ["ssh", "-t", args.host, f"env {exports} sh {remote_script}"],
-        capture_output=True,
-        text=True,
         check=False,
     )
-    sys.stderr.write(result.stderr)
     ssh(args.host, f"rm -f {shlex.quote(remote_script)}", check=False, quiet=True)
     if result.returncode != 0:
         raise SystemExit(f"capture failed on {args.host} ({result.returncode})")
-    # The count is the last thing the script prints, but stdout is not ours alone — read the last
-    # line that is a number rather than trusting the last line.
-    counts = [line.strip() for line in result.stdout.splitlines() if line.strip().isdigit()]
-    if not counts:
-        raise SystemExit(f"the robot reported no frame count:\n{result.stdout.strip()}")
-    frames = int(counts[-1])
-
     local_dir.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         ["rsync", "-a", "--remove-source-files", f"{args.host}:{remote_dir}/", f"{local_dir}/"],
         check=True,
     )
     ssh(args.host, f"rmdir {shlex.quote(remote_dir)} 2>/dev/null || true", check=False, quiet=True)
+
+    # Counted here rather than parsed out of the robot's output: the frames are the truth, and a
+    # number scraped from a terminal that also carried a password prompt is not.
+    frames = len(list(local_dir.glob("frame_*.jpg")))
+    if frames == 0:
+        raise SystemExit(f"no frames arrived in {local_dir}")
 
     Session(
         session=session,

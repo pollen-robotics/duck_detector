@@ -99,5 +99,3 @@ COUNT=$(find "$DIR" -name 'frame_*.jpg' | wc -l)
 say "wrote ${COUNT} frames"
 [ "$COUNT" -gt 0 ] || die "no frames — is anything else holding $DEVICE? journalctl -u mediad -b"
 
-# The one line stdout carries: the caller reads it and puts it in the session record.
-printf '%s\n' "$COUNT"
