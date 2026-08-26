@@ -154,11 +154,36 @@ better than a blur transform would.
 
 `--export` writes ONNX with static shapes at opset 12, which is what `rknn-toolkit2` will take.
 
-### export — after that
+### export
 
-The ONNX exists; the RKNN conversion does not yet. INT8 with a calibration set drawn from the
-robot's own frames, then measured on the board — quantisation is where a detector that worked on the
-laptop stops working, so it is a measurement rather than an assumption.
+```bash
+uv run --isolated --python 3.12 --with rknn-toolkit2 --with pillow --with onnxruntime \
+    --with "setuptools<81" --with "onnx==1.16.1" scripts/to_rknn.py \
+    runs/detect/duck-v1/weights/best.onnx
+```
+
+Its own interpreter and its own pins, because `rknn-toolkit2` publishes wheels for cp310–cp312
+(this repo runs 3.13), still imports `pkg_resources` (gone in setuptools 84) and still calls
+`onnx.mapping` (gone after onnx 1.16). None of that is negotiable, so it is written down here
+rather than rediscovered.
+
+10 MB of float ONNX becomes **3.9 MB of INT8 RKNN**, quantised against 120 letterboxed frames drawn
+from the real sessions. The script then runs both models on a frame the corrections say has a duck
+in it and matches the detections as *sets*:
+
+```
+  float onnx: 2 box(es) after nms
+  int8 rknn : 2 box(es) after nms
+  2 of 2 kept, mean overlap 95%
+  scores: float ['0.92', '0.91']  int8 ['1.38', '1.38']
+```
+
+Two things that cost an hour and are now in the code as comments. The head emits 2100 candidates,
+so **one duck is twenty overlapping boxes** until something suppresses them — comparing "the best
+box" of each model compared two arbitrary members of the same cluster and reported 8% overlap on a
+model that was working perfectly. And **the int8 output tensor carries its own scale**, so scores
+land outside 0..1: a confidence threshold has to be set against the quantised model rather than
+inherited from the float one.
 
 ## One local wrinkle
 
