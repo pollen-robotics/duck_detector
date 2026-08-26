@@ -111,6 +111,30 @@ What the two halves are doing, for when one of them misbehaves:
 the pre-labeller thinks before opening the editor, and `uv run review --import <export>.json` reads
 a manual export if the API round trip ever does not happen.
 
+### Is the pre-labeller worth it
+
+```bash
+uv run agreement datasets/raw/<session>
+```
+
+Compares what it drew with what survived the correction pass, which is the number that decides
+whether to keep using it. On the first session:
+
+```
+  frames reviewed      50  (6 deliberately empty)
+  frames untouched     44  (88%)
+  boxes accepted       50
+  boxes nudged         0
+  boxes drawn anew     1   ← what the pre-labeller missed
+  boxes deleted        6   ← what it invented
+  precision 89%  recall 98%
+```
+
+88% of frames needed no touch at all, and nothing had to be nudged — so the boxes are not merely
+in the right place, they are tight enough to accept. That is the case for pointing it at hundreds
+of frames and keeping the human job to "glance, Ctrl+Enter". It is also the case for the low
+threshold: the single box it missed cost more attention than the six it invented.
+
 ### train
 
 ```bash

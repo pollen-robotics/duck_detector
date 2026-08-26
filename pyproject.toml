@@ -45,6 +45,7 @@ autolabel = "duck_detector.autolabel:main"
 review = "duck_detector.review:main"
 dataset = "duck_detector.dataset:main"
 train = "duck_detector.train:main"
+agreement = "duck_detector.agreement:main"
 
 [tool.ruff]
 src = ["src"]
