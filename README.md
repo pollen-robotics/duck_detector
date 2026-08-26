@@ -81,6 +81,12 @@ a settings page.
 Re-running it on a session you are halfway through costs a second: the triage and the pre-labels are
 already on disk, and a project that already has its tasks is left alone.
 
+It opens the **labelling stream**, not the task table: in the table a frame opens in a modal where
+submitting does not move on and half the shortcuts are unbound, which is maddening across fifty
+frames. In the stream, `1` selects the label, `Ctrl+Enter` submits and advances, `Delete` removes the
+selected box, `Ctrl+Z` undoes. A frame with nothing in it should be submitted empty — that is a
+negative, and it is worth having.
+
 Label Studio runs out of `.label-studio/` in the repo, with a user this tool invents and a password
 it writes down there — so it cannot collide with another Label Studio, and `rm -rf .label-studio` is
 a clean slate. The port is 8080, or the next one free.

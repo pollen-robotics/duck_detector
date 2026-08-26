@@ -46,10 +46,12 @@ INSTANCE = Path(".label-studio")
 # rather than a smaller duck.
 CLASS = "duck"
 
+# `hotkey="1"` because with one class there is no reason to reach for the mouse to say which label
+# you mean, and the shortcut only exists if the config asks for it.
 LABEL_CONFIG = f"""<View>
   <Image name="image" value="$image" zoom="true" zoomControl="true" rotateControl="false"/>
   <RectangleLabels name="label" toName="image">
-    <Label value="{CLASS}" background="#00c853"/>
+    <Label value="{CLASS}" background="#00c853" hotkey="1"/>
   </RectangleLabels>
 </View>
 """
@@ -410,11 +412,22 @@ def run(session: Path, port: int, relabel: bool, open_browser: bool) -> None:
                 f"{result.get('prediction_count')} with a box already drawn"
             )
 
-        url = f"http://localhost:{port}/projects/{project}/data"
+        # **The labelling stream, not the table.** In the data manager a task opens in a modal
+        # where submitting does not move on and half the shortcuts are unbound — which is
+        # infuriating for exactly the fifty frames this is for. `labeling=1` asks for the stream;
+        # if a version ever ignores it you land on the table, and "Label All Tasks" is the button
+        # that gets there.
+        url = f"http://localhost:{port}/projects/{project}/data?labeling=1"
         print(
             f"\n  {url}\n"
             f"  sign in once as {creds['email']} / {creds['password']}\n\n"
-            "  delete what is not a duck, drag what is close, submit what is right.\n"
+            "  the keys that matter:\n"
+            "    1              select the duck label (then drag a box)\n"
+            "    Ctrl+Enter     submit and go to the next frame\n"
+            "    Delete         remove the selected box\n"
+            "    Ctrl+Z         undo\n"
+            "  a frame with nothing in it: submit it empty — that is a negative, and useful.\n"
+            "  if you land on a table of tasks instead, click 'Label All Tasks' once.\n\n"
             "  then Ctrl-C here, and the corrections come back as labels.\n"
         )
         if open_browser:
