@@ -73,27 +73,40 @@ fi
 # The helper is what `scripts/setup-rkaiq.sh` installs; without it, capture still works from the
 # boot mode, only slower.
 if [ -x /usr/local/bin/rkaiq-pin-sensor-mode ]; then
-    sudo /usr/local/bin/rkaiq-pin-sensor-mode >/dev/null 2>&1 || true
+    # Not silenced: the boot mode caps the sensor at ~18 fps against 1080p's 30, which is where
+    # the first session's "30 seconds" quietly became fifty.
+    sudo /usr/local/bin/rkaiq-pin-sensor-mode || say "WARNING: could not pin the sensor mode"
+else
+    say "no rkaiq-pin-sensor-mode on this board; capturing from whatever mode the sensor booted in"
 fi
 
 mkdir -p "$DIR"
 rm -f "$DIR"/frame_*.jpg
 
-# 30 fps off the sensor, decimated to HZ *before* the colour conversion so only the frames that
-# are kept cost anything. The rotation is not optional: `mediad` turns the picture a quarter turn
-# before its tee, so upright is what a model will see at inference — a dataset captured sideways
-# trains a detector for a camera nobody has.
-BUFFERS=$((30 * SECONDS_))
+# **Stopped by the clock, not by a frame count.** It used to ask for `30 * seconds` buffers, which
+# assumes the sensor delivers 30 fps — the first session ran at ~18 (the boot mode) and "30
+# seconds" came back as fifty. `timeout -s INT` with `gst-launch -e` turns the deadline into an EOS,
+# so the last JPEG is whole and `--seconds` means seconds whatever the sensor is doing.
+#
+# Decimated to HZ *before* the colour conversion, so only the frames that are kept cost anything.
+# The rotation is not optional: `mediad` turns the picture a quarter turn before its tee, so upright
+# is what a model sees at inference — a dataset captured sideways trains a detector for a camera
+# nobody has.
 say "capturing ${SECONDS_}s at ${HZ_NUM}/${HZ_DEN} Hz (${WIDTH}x${HEIGHT}, flip ${FLIP}) into ${DIR}"
-gst-launch-1.0 -e --no-position \
-    v4l2src device="$DEVICE" num-buffers="$BUFFERS" \
+RC=0
+timeout -s INT "$SECONDS_" gst-launch-1.0 -e --no-position \
+    v4l2src device="$DEVICE" \
     ! video/x-raw,format=UYVY,width="$WIDTH",height="$HEIGHT",framerate=30/1 \
     ! videorate ! video/x-raw,framerate="$HZ_NUM"/"$HZ_DEN" \
     ! videoconvert \
     ! videoflip video-direction="$FLIP" \
     ! jpegenc quality="$QUALITY" \
     ! multifilesink location="$DIR/frame_%05d.jpg" \
-    >&2
+    >&2 || RC=$?
+
+# 124 is `timeout` doing its job on a pipeline that ignored the EOS; anything else is a real
+# failure, and the frame count below is the second opinion either way.
+[ "$RC" = 0 ] || [ "$RC" = 124 ] || die "gst-launch failed (${RC})"
 
 COUNT=$(find "$DIR" -name 'frame_*.jpg' | wc -l)
 say "wrote ${COUNT} frames"

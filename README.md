@@ -23,7 +23,8 @@ keeps its 50 Hz control loop, on a camera mounted 20 cm off the floor behind a w
 | stage | what it does | state |
 |---|---|---|
 | **capture** | pull stills from a robot's own camera, one session at a time | works |
-| **label** | pre-label with an open-vocabulary detector, then correct by hand | next |
+| **triage** | rank a session's frames, because most of them are blurred floor | works |
+| **label** | pre-label with an open-vocabulary detector, then correct by hand | works, needs the correction pass |
 | **train** | fine-tune a small detector, split by session | next |
 | **export** | ONNX → RKNN, INT8, and measure it on the board | after that |
 
@@ -51,19 +52,47 @@ how much it buys:
   ducks in curtains. Tag these `empty-<room>`.
 - **The awkward cases**: backlit against a window, a duck on a dark floor, two ducks overlapping,
   a duck lying down after a fall, wheels on.
-- **Other yellow things.** A rubber duck, a banana, a cushion. This is what stops the model
-  learning "yellow blob".
+- **Other robots and other toys.** A Reachy Mini turned up in the first session's background for
+  free; a stool and a pair of legs were the pre-labeller's two false positives. These are the hard
+  negatives, and they are what stop the model learning "small thing on a floor".
 
 Keep sessions short and many rather than one long one: a session is the unit the train/val split
 uses, because two frames half a second apart are the same picture and mixing them across the split
 reports a score the model has not earned.
 
-### label — next
+### triage
 
-The plan: pre-label with an open-vocabulary detector (OWLv2 or Grounding DINO, prompted
-`a small yellow duck robot`) and correct by hand, rather than draw thousands of boxes from nothing.
-An 8 GB laptop GPU runs either at a few frames a second, which is plenty for a few thousand stills,
-and the correction pass is the only part that costs a human.
+```bash
+uv run triage datasets/raw/<session>
+```
+
+A duck walking around films the floor: of the first session's 99 frames, most are a soft grey blur
+and a handful have a room and another duck in them. Two cheap numbers per frame — variance of a
+Laplacian for sharpness, mean edge energy for content — rank them, and `triage.json` records the
+numbers so the thresholds can be argued with rather than guessed at. It keeps a deliberate sample of
+the empty frames too, because a detector that has never seen an empty room finds ducks in curtains.
+
+### label
+
+```bash
+uv sync --extra label
+uv run autolabel datasets/raw/<session> --sheet
+```
+
+Grounding DINO (tiny) prompted with noun phrases, then a person corrects it. On the first session
+it found a duck in 48 of 50 frames, scores 0.31–0.67, with two false positives — a blue stool and a
+pair of legs. That is the point: deleting two boxes is a different job from drawing fifty.
+
+Two things learned the hard way, both in the code as comments:
+
+- **Every noun in the prompt is a query.** `a small robot standing on the floor` asked it to find
+  the floor, and it did, in a third of the frames, with a box the size of the frame.
+- **Colour is not a cue.** These robots come in blue, white and grey shells, so `yellow duck` finds
+  the cushion.
+
+`--sheet` renders the boxes onto a contact sheet. Look at it before correcting anything; it is how
+you find out the prompt is describing the sofa. The threshold stays low on purpose — a missing box
+costs more human time than a wrong one.
 
 ### train — next
 

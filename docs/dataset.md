@@ -48,8 +48,12 @@ Roughly in order of what it buys:
    in curtains. Tag `empty-<room>`.
 3. **The awkward ones**: backlit against a window, dark floor, two ducks overlapping, a duck lying
    down after a fall, wheels on.
-4. **Other yellow things**: a rubber duck, a banana, a cushion. This is what stops the model
-   learning "yellow blob".
+4. **Other robots and other toys**: a Reachy Mini, a stool, a bag on the floor. These are the hard
+   negatives — the pre-labeller's mistakes on session one were a blue stool and a pair of legs,
+   which is exactly what wants correcting rather than avoiding.
+
+The shells come in **blue, white and grey**, so colour is not a cue and nothing in this pipeline
+treats it as one.
 
 ## Layout
 
