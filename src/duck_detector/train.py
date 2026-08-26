@@ -49,9 +49,12 @@ def main() -> None:
 
     # Imported here rather than at module scope: `--help` should work without the train extra
     # installed, and ultralytics takes seconds to import.
-    from ultralytics import YOLO
+    from duck_detector.torchsetup import missing, prepare_cuda
 
-    from duck_detector.torchsetup import prepare_cuda
+    try:
+        from ultralytics import YOLO
+    except ImportError as error:  # pragma: no cover - depends on how the venv was synced
+        raise SystemExit(missing("ultralytics")) from error
 
     # Before the model is built, because this is what decides whether a convolution runs at all on
     # this machine — see the module for why. Ultralytics takes `device` as a string or index.

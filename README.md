@@ -29,10 +29,17 @@ keeps its 50 Hz control loop, on a camera mounted 20 cm off the floor behind a w
 | **train** | fine-tune a small detector, split by session, export ONNX | works, needs data |
 | **export** | ONNX → RKNN, INT8, and measure it on the board | after that |
 
+**One thing about the extras before anything else:** they are not additive. `uv sync --extra
+train` uninstalls what `--extra label` put there, and a bare `uv sync` uninstalls both — so unless
+you only ever capture, the line to use is:
+
+```bash
+uv sync --all-extras
+```
+
 ### capture
 
 ```bash
-uv sync
 uv run capture --host microduck@192.168.10.124 --tag kitchen-afternoon --seconds 120
 ```
 
@@ -76,7 +83,6 @@ the empty frames too, because a detector that has never seen an empty room finds
 ### label
 
 ```bash
-uv sync --extra label
 uv run autolabel datasets/raw/<session> --sheet
 ```
 
@@ -98,7 +104,6 @@ costs more human time than a wrong one.
 ### review
 
 ```bash
-uv sync --extra review
 uv run review prepare datasets/raw/<session>   # tasks with the boxes already drawn
 uv run review serve                            # Label Studio, pointed at this repo
 #   … correct, then Export → JSON
@@ -116,7 +121,6 @@ A frame somebody opened and left empty is a negative and is kept. A frame nobody
 ### train
 
 ```bash
-uv sync --extra train
 uv run dataset build          # or --smoke, for one session, plumbing only
 uv run train --export
 ```

@@ -23,11 +23,7 @@ import argparse
 import json
 from pathlib import Path
 
-import torch
 from PIL import Image, ImageDraw
-from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
-
-from duck_detector.torchsetup import prepare_cuda
 
 # Small, fast, and good at natural phrases. The alternative measured here was OWLv2, which wants
 # noun phrases rather than descriptions and did worse on a robot it has never seen.
@@ -53,6 +49,18 @@ MAX_AREA = 0.45
 
 
 def load(device: str):
+    """The detector, imported here rather than at the top of the file.
+
+    `--help` and a dry run must work in a checkout that has only the capture dependencies, and the
+    message when they are missing should be the command that fixes it rather than a traceback.
+    """
+    from duck_detector.torchsetup import missing
+
+    try:
+        from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+    except ImportError as error:  # pragma: no cover - depends on how the venv was synced
+        raise SystemExit(missing("transformers")) from error
+
     processor = AutoProcessor.from_pretrained(MODEL)
     model = AutoModelForZeroShotObjectDetection.from_pretrained(MODEL).to(device)
     model.eval()
@@ -92,10 +100,12 @@ def suppress(found: list[tuple[list[float], float, str]]) -> list[tuple[list[flo
     return kept
 
 
-@torch.no_grad()
 def detect(processor, model, image: Image.Image, device: str, box_threshold: float):
+    import torch
+
     inputs = processor(images=image, text=PROMPT, return_tensors="pt").to(device)
-    outputs = model(**inputs)
+    with torch.no_grad():
+        outputs = model(**inputs)
     result = processor.post_process_grounded_object_detection(
         outputs,
         inputs.input_ids,
@@ -170,6 +180,8 @@ def main() -> None:
         frames = frames[: args.limit]
     out = args.out or Path("datasets/labelled") / args.session.name
     out.mkdir(parents=True, exist_ok=True)
+
+    from duck_detector.torchsetup import prepare_cuda
 
     device = prepare_cuda()
     print(f"{MODEL} on {device}: {len(frames)} frames, threshold {args.threshold}")

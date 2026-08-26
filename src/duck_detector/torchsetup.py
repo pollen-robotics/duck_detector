@@ -13,9 +13,30 @@ same stack trace.
 from __future__ import annotations
 
 
+# Said in one place, because both the pre-labeller and the trainer can hit it, and the useful part
+# is the second sentence: extras are not additive. `uv sync --extra train` uninstalls the `label`
+# extra, and a bare `uv sync` uninstalls both — which is how a working checkout loses transformers
+# between two commands.
+def missing(package: str) -> str:
+    """What to say when a heavy dependency is not installed.
+
+    Names the package rather than the extra, because the extras overlap — `train` brings torch in
+    through ultralytics but not transformers, so "this needs torch" is wrong exactly when somebody
+    has synced the other extra and is confused already.
+    """
+    return (
+        f"this needs {package}, which is not installed:\n"
+        "    uv sync --all-extras\n"
+        "(a sync for one extra uninstalls the others; --all-extras is the one that keeps working)"
+    )
+
+
 def prepare_cuda(verbose: bool = True) -> str:
     """The device to use, having proved it can convolve. `"cuda"` or `"cpu"`."""
-    import torch
+    try:
+        import torch
+    except ImportError as error:
+        raise SystemExit(missing("torch")) from error
 
     if not torch.cuda.is_available():
         return "cpu"
