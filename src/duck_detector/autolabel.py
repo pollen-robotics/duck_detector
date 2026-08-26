@@ -160,6 +160,67 @@ def sheet(rows: list[tuple[Path, list]], out: Path, columns: int = 6, thumb: int
     canvas.save(out)
 
 
+def run(
+    session: Path,
+    out: Path,
+    *,
+    threshold: float = 0.30,
+    use_all: bool = False,
+    limit: int = 0,
+    make_sheet: bool = False,
+) -> int:
+    """Pre-label a session. Returns the number of boxes drawn.
+
+    Split out from `main` so `review` can do this itself: one command from a raw session to a
+    browser ready to correct beats four commands in the right order.
+    """
+    from duck_detector.torchsetup import prepare_cuda
+
+    frames = selected_frames(session, use_all)
+    if limit:
+        frames = frames[:limit]
+    out.mkdir(parents=True, exist_ok=True)
+
+    device = prepare_cuda()
+    print(f"{MODEL} on {device}: {len(frames)} frames, threshold {threshold}")
+    processor, model = load(device)
+
+    records, rows, boxes_total = [], [], 0
+    for path in frames:
+        image = Image.open(path).convert("RGB")
+        found = detect(processor, model, image, device, threshold)
+        boxes_total += len(found)
+        (out / f"{path.stem}.txt").write_text(
+            "".join(to_yolo(box, image.width, image.height) + "\n" for box, _, _ in found)
+        )
+        records.append(
+            {
+                "frame": path.name,
+                "boxes": [
+                    {"box": box, "score": round(score, 3), "label": label}
+                    for box, score, label in found
+                ],
+            }
+        )
+        rows.append((path, found))
+
+    (out / "labels.json").write_text(
+        json.dumps(
+            {"model": MODEL, "prompt": PROMPT, "threshold": threshold, "frames": records},
+            indent=2,
+        )
+        + "\n"
+    )
+    (out / "images.txt").write_text("".join(f"{p}\n" for p in frames))
+    print(f"{boxes_total} boxes over {len(frames)} frames → {out}")
+
+    if make_sheet:
+        path = out / "sheet.png"
+        sheet(rows, path)
+        print(f"contact sheet → {path}")
+    return boxes_total
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Pre-label a session with an open-vocabulary detector.",
@@ -175,52 +236,14 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0, help="stop after N frames (a quick look)")
     args = parser.parse_args()
 
-    frames = selected_frames(args.session, args.all)
-    if args.limit:
-        frames = frames[: args.limit]
-    out = args.out or Path("datasets/labelled") / args.session.name
-    out.mkdir(parents=True, exist_ok=True)
-
-    from duck_detector.torchsetup import prepare_cuda
-
-    device = prepare_cuda()
-    print(f"{MODEL} on {device}: {len(frames)} frames, threshold {args.threshold}")
-    processor, model = load(device)
-
-    records, rows, boxes_total = [], [], 0
-    for path in frames:
-        image = Image.open(path).convert("RGB")
-        found = detect(processor, model, image, device, args.threshold)
-        boxes_total += len(found)
-        (out / f"{path.stem}.txt").write_text(
-            "".join(to_yolo(box, image.width, image.height) + "\n" for box, _, _ in found)
-        )
-        records.append(
-            {
-                "frame": path.name,
-                "boxes": [
-                    {"box": box, "score": round(score, 3), "label": label}
-                    for box, score, label in found
-                ],
-            }
-        )
-        rows.append((path, found))
-        print(f"  {path.name}: {len(found)}")
-
-    (out / "labels.json").write_text(
-        json.dumps(
-            {"model": MODEL, "prompt": PROMPT, "threshold": args.threshold, "frames": records},
-            indent=2,
-        )
-        + "\n"
+    run(
+        args.session,
+        args.out or Path("datasets/labelled") / args.session.name,
+        threshold=args.threshold,
+        use_all=args.all,
+        limit=args.limit,
+        make_sheet=args.sheet,
     )
-    (out / "images.txt").write_text("".join(f"{p}\n" for p in frames))
-    print(f"{boxes_total} boxes over {len(frames)} frames → {out}")
-
-    if args.sheet:
-        path = out / "sheet.png"
-        sheet(rows, path)
-        print(f"contact sheet → {path}")
 
 
 if __name__ == "__main__":

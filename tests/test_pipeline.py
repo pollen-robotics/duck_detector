@@ -81,7 +81,7 @@ def test_the_review_round_trip_keeps_the_boxes(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     name = "20260101T000000Z_a_duck"
     make_session(tmp_path, name)
-    review.prepare(tmp_path / "datasets/raw" / name, None)
+    review.prepare(tmp_path / "datasets/raw" / name, tmp_path / "datasets/labelled" / name)
 
     tasks = json.loads((tmp_path / "datasets/review" / name / "tasks.json").read_text())
     assert len(tasks) == 4

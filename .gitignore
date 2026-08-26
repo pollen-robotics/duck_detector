@@ -7,6 +7,10 @@
 *.rknn
 *.pt
 
+# The Label Studio instance `review` runs: its database, its media, and the password this repo
+# invented for it. Disposable — deleting it is how you start the correction pass over.
+/.label-studio/
+
 # Python
 .venv/
 __pycache__/

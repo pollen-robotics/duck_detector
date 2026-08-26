@@ -23,9 +23,7 @@ keeps its 50 Hz control loop, on a camera mounted 20 cm off the floor behind a w
 | stage | what it does | state |
 |---|---|---|
 | **capture** | pull stills from a robot's own camera, one session at a time | works |
-| **triage** | rank a session's frames, because most of them are blurred floor | works |
-| **label** | pre-label with an open-vocabulary detector, then correct by hand | works, needs the correction pass |
-| **review** | correct those boxes in Label Studio, and get YOLO labels back | works |
+| **review** | triage, pre-label, correct in Label Studio, get YOLO labels back — one command | works |
 | **train** | fine-tune a small detector, split by session, export ONNX | works, needs data |
 | **export** | ONNX → RKNN, INT8, and measure it on the board | after that |
 
@@ -68,55 +66,44 @@ Keep sessions short and many rather than one long one: a session is the unit the
 uses, because two frames half a second apart are the same picture and mixing them across the split
 reports a score the model has not earned.
 
-### triage
+### review — the whole middle of the pipeline, in one command
 
 ```bash
-uv run triage datasets/raw/<session>
+uv run review datasets/raw/<session>
 ```
 
-A duck walking around films the floor: of the first session's 99 frames, most are a soft grey blur
-and a handful have a room and another duck in them. Two cheap numbers per frame — variance of a
-Laplacian for sharpness, mean edge energy for content — rank them, and `triage.json` records the
-numbers so the thresholds can be argued with rather than guessed at. It keeps a deliberate sample of
-the empty frames too, because a detector that has never seen an empty room finds ducks in curtains.
+That does all of it: ranks the frames, pre-labels them, starts Label Studio, logs in, creates the
+project, imports the tasks with the boxes already drawn, and opens a browser at them. Correct the
+boxes, press **Ctrl-C in the terminal**, and the corrections come back through the API as YOLO
+labels in `datasets/reviewed/<session>/`. Nothing is exported by hand, and no token is copied out of
+a settings page.
 
-### label
+Re-running it on a session you are halfway through costs a second: the triage and the pre-labels are
+already on disk, and a project that already has its tasks is left alone.
 
-```bash
-uv run autolabel datasets/raw/<session> --sheet
-```
+Label Studio runs out of `.label-studio/` in the repo, with a user this tool invents and a password
+it writes down there — so it cannot collide with another Label Studio, and `rm -rf .label-studio` is
+a clean slate. The port is 8080, or the next one free.
 
-Grounding DINO (tiny) prompted with noun phrases, then a person corrects it. On the first session
-it found a duck in 48 of 50 frames, scores 0.31–0.67, with two false positives — a blue stool and a
-pair of legs. That is the point: deleting two boxes is a different job from drawing fifty.
+What the two halves are doing, for when one of them misbehaves:
 
-Two things learned the hard way, both in the code as comments:
+- **Triage.** A duck walking around films the floor: of the first session's 99 frames, most are a
+  soft grey blur. Two cheap numbers per frame — variance of a Laplacian for sharpness, mean edge
+  energy for content — pick the 40 worth looking at and keep 10 empty ones as negatives, because a
+  detector that has never seen an empty room finds ducks in curtains. `triage.json` records the
+  numbers so the thresholds can be argued with rather than guessed at.
+- **Pre-labelling.** Grounding DINO (tiny), prompted with noun phrases. On the first session it
+  found a duck in 48 of 50 frames, 0.31–0.67, with two false positives — a blue stool and a pair of
+  legs. That is the point: deleting two boxes is a different job from drawing fifty. Two things
+  learned the hard way, both in the code as comments: **every noun in the prompt is a query** (`a
+  small robot standing on the floor` asked it to find the floor, and it did, frame-sized, in a
+  third of them), and **colour is not a cue** — these robots come in blue, white and grey, so
+  `yellow duck` finds the cushion. The threshold stays low on purpose: a missing box costs more
+  human time than a wrong one.
 
-- **Every noun in the prompt is a query.** `a small robot standing on the floor` asked it to find
-  the floor, and it did, in a third of the frames, with a box the size of the frame.
-- **Colour is not a cue.** These robots come in blue, white and grey shells, so `yellow duck` finds
-  the cushion.
-
-`--sheet` renders the boxes onto a contact sheet. Look at it before correcting anything; it is how
-you find out the prompt is describing the sofa. The threshold stays low on purpose — a missing box
-costs more human time than a wrong one.
-
-### review
-
-```bash
-uv run review prepare datasets/raw/<session>   # tasks with the boxes already drawn
-uv run review serve                            # Label Studio, pointed at this repo
-#   … correct, then Export → JSON
-uv run review import <export>.json             # corrections back as YOLO labels
-```
-
-`serve` sets `LOCAL_FILES_SERVING_ENABLED` and the document root, and `prepare` writes tasks that
-point at `/data/local-files/?d=…` — so the frames load with nothing configured in the UI. The
-pre-labeller's boxes arrive as *predictions*, which is the difference between accepting a box and
-drawing one.
-
-A frame somebody opened and left empty is a negative and is kept. A frame nobody opened is skipped:
-"there is nothing here" and "nobody looked" are different, and only one of them is training data.
+`uv run autolabel <session> --sheet` renders the boxes onto a contact sheet if you want to see what
+the pre-labeller thinks before opening the editor, and `uv run review --import <export>.json` reads
+a manual export if the API round trip ever does not happen.
 
 ### train
 
@@ -154,7 +141,10 @@ fix, whenever somebody picks one.
 ## Layout
 
 ```
-datasets/raw/<session>/       frames + session.json   (gitignored)
+datasets/raw/<session>/       frames + session.json + triage.json   (gitignored)
+datasets/labelled/<session>/  the pre-labeller's boxes, and a contact sheet
+datasets/reviewed/<session>/  what a person corrected — the training labels
+datasets/yolo/                what `dataset build` assembles, symlinks to raw
 src/duck_detector/            the tools
 docs/                         notes worth keeping
 ```
