@@ -1,0 +1,15 @@
+# Datasets and everything derived from them. The repo carries the recipe, not the data:
+# a session is tens of megabytes of JPEG and belongs in object storage or on a NAS.
+/datasets/
+/runs/
+/exports/
+*.onnx
+*.rknn
+*.pt
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/

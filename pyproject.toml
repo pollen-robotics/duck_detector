@@ -1,0 +1,50 @@
+[build-system]
+requires = ["uv_build>=0.8.19,<0.9.0"]
+build-backend = "uv_build"
+
+[project]
+name = "duck-detector"
+version = "0.1.0"
+description = "Finding Microducks in a Microduck's camera: capture, labelling, training and the NPU export"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+    "pillow>=11.0",
+]
+
+[dependency-groups]
+# Dev only, and installed by a plain `uv sync` — so the tests run without pulling CUDA.
+dev = ["pytest>=8.0", "ruff>=0.8"]
+
+[project.optional-dependencies]
+# Training and labelling pull CUDA wheels and a few gigabytes of weights, and neither is
+# needed to capture a session from a robot. `uv sync` gets you the capture tool; `uv sync
+# --extra train` gets the rest.
+train = [
+    "ultralytics>=8.3",
+    "onnx>=1.17",
+    "onnxruntime>=1.20",
+]
+label = [
+    "torch>=2.5",
+    "transformers>=4.46",
+]
+
+[project.scripts]
+# One command per stage of the pipeline in the README.
+capture = "duck_detector.capture:main"
+
+[tool.ruff]
+src = ["src"]
+indent-width = 4
+# Wider than ruff's 88 to match the Rust side of the fence, where the robot's code sits at 100.
+# The comments here carry reasoning, and rewrapping prose at 88 costs a line in three.
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
