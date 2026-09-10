@@ -31,7 +31,7 @@ you only ever capture, the line to use is:
 
 ```bash
 uv sync --all-extras
-hf auth login        # once; the Hub, and the rendezvous that reaches the robot, use this token
+hf auth login        # once, for the Hub
 ```
 
 ### capture
@@ -41,26 +41,26 @@ uv run capture --tag kitchen-afternoon --seconds 120 --push
 ```
 
 **Nothing on the robot is stopped, and nothing is installed on it.** `mediad` holds the camera and
-keeps holding it. The tool asks it for `media.stream` — the same call the vision-demo Space makes
-— and the robot dials a WebSocket the tool opens on the laptop and pushes JPEG frames down it,
-upright, at 2 Hz, straight off the tee that already feeds the console's video and the robot's own
-duck detector. It is `duckctl open` with a program at the far end instead of a browser:
+keeps holding it. The tool opens the same session `duckctl open`'s page does — the robot's own
+WebRTC signalling server on port 8443, a `control` datachannel, JSON-RPC on it — and asks for
+`media.stream`. The robot then dials a WebSocket the tool opens on the laptop and pushes JPEG
+frames down it, upright, at 2 Hz, straight off the tee that already feeds the console's video and
+the robot's own duck detector:
 
 ```
-laptop ──media.stream {url: "ws://192.168.10.42:8765/frames"}──► rendezvous ──► robot
-robot  ═══════════════ JPEG frames, LAN, direct ═══════════════════════════► laptop
+laptop ──ws://robot:8443, datachannel: media.stream {url: "ws://laptop:8765/frames"}──► robot
+robot  ═══════════════ JPEG frames, LAN, direct ═══════════════════════════════════► laptop
 ```
 
-The instruction crosses the Hugging Face rendezvous, which is how the robot is found (no address
-to type: the duck online on your account is the duck) and why `hf auth login` is a prerequisite.
-The pixels do not: the robot has to be able to reach the laptop, so same LAN, and `--advertise
-<ip>` when the laptop's guess at its own address is wrong (two LANs, a VPN). `--dry-run` finds the
-duck and streams nothing. `-v` logs the rendezvous traffic.
+Everything stays on the LAN. `--host` is the robot's address; without it the tool asks `duckctl ip`
+over Bluetooth. The robot has to be able to reach the laptop, and `--advertise <ip>` names the
+laptop's address when its own guess is wrong (two LANs, a VPN). `--dry-run` opens the session and
+streams nothing. `-v` logs the signalling and the calls.
 
-Two rules the transport imposes, both said plainly by the tool when hit: **one consumer at a
-time** — a console open on the robot (`duckctl open`) makes it busy — and the robot needs a
-`mediad` with the control lane over the rendezvous (the robot repo's current `main`; an older one
-accepts the session and answers nothing, which the tool says in as many words).
+The same handshake relayed through the Hugging Face rendezvous exists in the robot repo, and the
+control lane works that way — but media across the internet does not yet, so this tool does not
+use it. **One consumer at a time**: a console open on the robot (`duckctl open`) makes it busy,
+and the tool says so.
 
 Frames arrive **already upright** (`mediad` turns them by the mount angle before its tee, and the
 hello says `rotate: 0`), so what is captured is what a model will be handed at inference, by
@@ -251,6 +251,6 @@ datasets/labelled/<session>/  the pre-labeller's boxes, and a contact sheet ├ 
 datasets/reviewed/<session>/  what a person corrected — the training labels ─┘
 datasets/yolo/                what `dataset build` assembles, symlinks to raw
 weights/                      what `model pull` fetches
-src/duck_detector/            the tools; robot.py is the rendezvous client, hub.py the Hub
+src/duck_detector/            the tools; robot.py is the LAN control channel, hub.py the Hub
 docs/                         notes worth keeping
 ```

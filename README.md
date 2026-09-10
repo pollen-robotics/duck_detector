@@ -12,14 +12,15 @@ A detector that finds Microducks in a Microduck's camera, for the robot's NPU. O
 
 ```bash
 uv sync --all-extras     # the extras are not additive; always sync them all
-hf auth login            # once — the Hub, and the rendezvous that finds the robot, use this token
+hf auth login            # once, for the Hub
 ```
 
 ## The whole sequence
 
 ```bash
-# 1. capture a session from a duck that is on and online (nothing is stopped or installed on it)
-uv run capture --tag kitchen-afternoon --seconds 120 --push
+# 1. capture a session from a duck on the same network (nothing is stopped or installed on it)
+uv run capture --host 192.168.10.124 --tag kitchen-afternoon --seconds 120 --push
+#    (no --host: it asks `duckctl ip` over Bluetooth)
 
 # 2. correct the pre-labels in Label Studio, Ctrl-C when done; the labels go to the Hub
 uv run review datasets/raw/<session> --push
@@ -40,10 +41,10 @@ uv run model pull                     # weights/duck_detect.{pt,onnx,rknn}
 
 ## The short version of each step
 
-- **capture** asks the robot for `media.stream`; the robot dials a WebSocket on the laptop and
-  pushes upright JPEG frames. The robot is found through the Hugging Face rendezvous. It must reach
-  the laptop (same LAN; `--advertise <ip>` if the guess is wrong), and a console open on it makes it
-  busy. Many short tagged sessions beat one long one; capture rooms with no duck too.
+- **capture** opens the same LAN WebRTC session `duckctl open` does and asks the robot for
+  `media.stream`; the robot dials a WebSocket on the laptop and pushes upright JPEG frames. Use
+  `--advertise <ip>` if the laptop guesses its own address wrong. A console open on the robot makes
+  it busy. Many short tagged sessions beat one long one; capture rooms with no duck too.
 - **review** triages, pre-labels with Grounding DINO, and opens Label Studio with the boxes drawn.
   `1` selects the label, `Ctrl+Enter` submits and advances, `Delete` removes a box. Submit empty
   frames empty.

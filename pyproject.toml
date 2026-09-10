@@ -10,13 +10,13 @@ readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
-# What every stage needs: the Hub (data and models live there, and the rendezvous that reaches
-# a robot authenticates with its token), the robot's frame stream, and reading a JPEG.
+# What every stage needs: the Hub (data and models live there), the robot's LAN control channel
+# (WebRTC, as the console page does it) and frame stream, and reading a JPEG.
 dependencies = [
     "pillow>=11.0",
     "huggingface_hub>=1.0",
-    "httpx>=0.27",
     "websockets>=13",
+    "aiortc>=1.15.0",
 ]
 
 [dependency-groups]

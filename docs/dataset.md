@@ -15,8 +15,8 @@ where the watching duck stands — and tag what changed.
 
 ## Where a session comes from
 
-The robot's own stream. `capture` asks `mediad` for `media.stream` — the same call the vision-demo
-Space makes — and the robot dials a WebSocket on the laptop and pushes JPEG frames down it, off the
+The robot's own stream. `capture` opens the LAN session `duckctl open` does and asks `mediad` for
+`media.stream`; the robot dials a WebSocket on the laptop and pushes JPEG frames down it, off the
 tee that already feeds the console's video and the robot's own duck detector. `mediad` is never
 stopped and nothing is installed on the board; the frames are, by construction, the picture the
 detector will be handed at inference.

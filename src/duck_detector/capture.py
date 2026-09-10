@@ -7,18 +7,18 @@ anywhere else train a detector for a camera nobody has.
     uv run capture --tag kitchen-afternoon --seconds 120
 
 **Nothing is stopped and nothing is installed.** `mediad` holds the camera and keeps holding it:
-this asks it for `media.stream`, the same call the vision-demo Space makes, and the robot dials a
-WebSocket this tool opens on the laptop and pushes JPEG frames down it — upright, at the rate asked
-for, straight off the tee that already feeds the console's video. It is `duckctl open` with a
-program on the far end instead of a browser, and it means the console's picture and the robot's
-own duck detector are what the dataset is captured through, by construction.
+this opens the same session `duckctl open`'s page does — WebRTC on the LAN, a `control`
+datachannel — and asks for `media.stream`. The robot then dials a WebSocket this tool opens on the
+laptop and pushes JPEG frames down it, upright, at the rate asked for, straight off the tee that
+already feeds the console's video and the robot's own duck detector. So the dataset is captured
+through exactly what a model will be handed at inference, by construction.
 
-    laptop ──media.stream {url: "ws://192.168.10.42:8765/frames"}──► rendezvous ──► robot
-    robot  ═══════════════ JPEG frames, LAN, direct ═══════════════════════════► laptop
+    laptop ──ws://robot:8443, datachannel: media.stream {url: "ws://laptop:8765/frames"}──► robot
+    robot  ═══════════════ JPEG frames, LAN, direct ═══════════════════════════════════► laptop
 
-The instruction crosses the Hugging Face rendezvous (`robot.py`); the pixels do not. The robot has
-to be able to reach the laptop — same LAN, or an address the laptop is reachable at — and
-`--advertise` names that address when the guess is wrong.
+Everything stays on the LAN (`robot.py`). `--host` is the robot's address, or `duckctl ip` finds it
+over Bluetooth when it is left out; `--advertise` is the laptop's address as the robot should dial
+it, when the guess is wrong.
 
 **Sessions are the unit, not frames.** Two frames half a second apart are the same picture for
 training purposes, so a split that mixes them across train and val reports a score the model has
@@ -156,9 +156,10 @@ def image_size(path: Path) -> tuple[int, int]:
         return image.width, image.height
 
 
-async def run(args: argparse.Namespace, lane: robot.Lane, duck: robot.Duck, out: dict) -> Path:
+async def run(args: argparse.Namespace, lane: robot.Lane, out: dict) -> Path:
     from websockets.asyncio.server import serve
 
+    duck = lane.producer
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     session = f"{stamp}_{args.tag}_{duck.name}"
     local_dir = Path(args.root) / session
@@ -180,13 +181,13 @@ async def run(args: argparse.Namespace, lane: robot.Lane, duck: robot.Duck, out:
     print(f"== {session}: {args.seconds or '∞'}s at {args.hz} Hz from {duck.name}", file=sys.stderr)
 
     async with serve(receiver.handle, "0.0.0.0", args.port):
-        answer = await asyncio.to_thread(lane.call, "media.stream", request)
+        answer = await lane.call("media.stream", request)
         print(f"== media.stream accepted: {json.dumps(answer)}", file=sys.stderr)
         try:
             try:
                 hello = await asyncio.wait_for(asyncio.shield(receiver.hello), HELLO_TIMEOUT)
             except TimeoutError:
-                status = await asyncio.to_thread(lane.call, "media.stream")
+                status = await lane.call("media.stream")
                 raise robot.RobotError(
                     f"the robot accepted the stream and never dialled {request['url']} "
                     f"(its view: {json.dumps(status)}). It has to reach this laptop: same "
@@ -213,7 +214,7 @@ async def run(args: argparse.Namespace, lane: robot.Lane, duck: robot.Duck, out:
             # streaming JPEGs at a laptop that has gone is a robot spending a core on nobody, and
             # redialling every 30 s until somebody notices.
             try:
-                await asyncio.to_thread(lane.call, "media.stream", {"url": None})
+                await lane.call("media.stream", {"url": None})
             except (robot.RobotError, robot.RpcError) as e:
                 print(f"== could not stop the stream: {e}", file=sys.stderr)
 
@@ -227,7 +228,7 @@ async def run(args: argparse.Namespace, lane: robot.Lane, duck: robot.Duck, out:
         session=session,
         tag=args.tag,
         robot=info.get("name") or duck.name,
-        serial=info.get("serial"),
+        serial=info.get("serial") or duck.serial,
         frames=receiver.frames,
         hz=args.hz,
         seconds=args.seconds,
@@ -253,30 +254,28 @@ async def run(args: argparse.Namespace, lane: robot.Lane, duck: robot.Duck, out:
     return local_dir
 
 
-def capture(args: argparse.Namespace) -> Path:
-    hf_token = robot.token()
-    duck = robot.choose(robot.ducks(hf_token), args.robot)
-    print(f"== {duck.label()}", file=sys.stderr)
-    if duck.busy:
-        raise robot.RobotError(
-            f"{duck.name} is busy with {duck.active_app or 'another consumer'} — close the "
-            "console on it, or wait for the other capture"
-        )
-    if args.dry_run:
-        print(
-            f"would ask {duck.name} to stream jpeg at {args.hz} fps, longest {args.longest}, to "
-            f"ws://{args.advertise or lan_address()}:{args.port}/frames",
-            file=sys.stderr,
-        )
-        return Path(args.root)
+async def session(args: argparse.Namespace, out: dict) -> None:
+    host = robot.find_host(args.host)
+    async with robot.Lane(host, port=args.signalling_port) as lane:
+        duck = lane.producer
+        print(f"== {duck.name} ({duck.release or 'release unknown'}) at {host}", file=sys.stderr)
+        if args.dry_run:
+            print(
+                f"would ask {duck.name} to stream jpeg at {args.hz} fps, longest {args.longest}, "
+                f"to ws://{args.advertise or lan_address()}:{args.port}/frames",
+                file=sys.stderr,
+            )
+            return
+        await run(args, lane, out)
 
+
+def capture(args: argparse.Namespace) -> Path | None:
     out: dict[str, Path] = {}
-    with robot.Lane(hf_token, duck.peer_id) as lane:
-        try:
-            asyncio.run(run(args, lane, duck, out))
-        except KeyboardInterrupt:
-            pass
-    return out["dir"]
+    try:
+        asyncio.run(session(args, out))
+    except KeyboardInterrupt:
+        pass
+    return out.get("dir")
 
 
 def main() -> None:
@@ -289,7 +288,10 @@ def main() -> None:
         required=True,
         help="what makes this session different: the room, the light, what is in front of it",
     )
-    parser.add_argument("--robot", help="which duck, by name; needed when more than one is online")
+    parser.add_argument("--host", help="the robot's address; default: what `duckctl ip` finds")
+    parser.add_argument(
+        "--signalling-port", type=int, default=robot.SIGNALLING_PORT, help="mediad's `--port`"
+    )
     parser.add_argument("--seconds", type=int, default=60, help="0 to run until Ctrl-C")
     parser.add_argument("--hz", type=float, default=2.0, help="frames per second (0.2 to 15)")
     parser.add_argument("--longest", type=int, default=DEFAULT_LONGEST, help="longest side, px")
@@ -299,8 +301,8 @@ def main() -> None:
     parser.add_argument("--root", default=str(DEFAULT_ROOT))
     parser.add_argument("--note", default="", help="anything worth remembering about this session")
     parser.add_argument("--push", action="store_true", help="upload the session to the Hub after")
-    parser.add_argument("--dry-run", action="store_true", help="find the duck, stream nothing")
-    parser.add_argument("-v", "--verbose", action="store_true", help="log the rendezvous traffic")
+    parser.add_argument("--dry-run", action="store_true", help="open the session, stream nothing")
+    parser.add_argument("-v", "--verbose", action="store_true", help="log the signalling and calls")
     args = parser.parse_args()
     if args.verbose:
         logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
@@ -309,7 +311,7 @@ def main() -> None:
         local_dir = capture(args)
     except (robot.RobotError, robot.RpcError) as e:
         raise SystemExit(f"capture: {e}") from None
-    if args.push and not args.dry_run:
+    if args.push and local_dir is not None:
         from duck_detector import hub
 
         hub.push_sessions([local_dir.name])

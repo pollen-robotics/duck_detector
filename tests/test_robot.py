@@ -1,207 +1,167 @@
-"""The control lane, against a rendezvous small enough to run in a test.
+"""The control lane, against a signalling server and a WebRTC peer standing in for `mediad`.
 
-The real one is `pollen-robotics/reachy-mini-central`; what matters here is the protocol's shape,
-which is the part that was got wrong once already: `startSession` answers in the POST body,
-everything else on the stream, and a `peer` envelope's `rpc` is the call.
+Real WebRTC over loopback: the fake robot offers, opens a `control` datachannel and answers
+JSON-RPC on it, so the whole handshake the console page does — welcome, list, startSession, offer
+in, answer out, channel up — is exercised rather than mocked.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
-import queue
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
+from aiortc import RTCPeerConnection, RTCSessionDescription
 
 from duck_detector import robot
 
 
-class FakeRendezvous:
-    """`GET /events` streams; `POST /send` answers `startSession` in the body and relays `rpc`.
+class FakeMediad:
+    """gst-plugins-rs's signalling protocol, one producer, and the robot's end of the channel."""
 
-    The "robot" on the far end answers every `rpc` with a canned result for its method, or refuses
-    it — and `media.stream` is answered the way `mediad` does, so the shape of the whole exchange
-    is the one a capture makes.
-    """
+    def __init__(self, *, producers=True, refuse_session=False):
+        self.producers = producers
+        self.refuse_session = refuse_session
+        self.received: list[dict] = []
+        self.pc: RTCPeerConnection | None = None
+        self.server = None
 
-    def __init__(self):
-        self.events: queue.Queue[dict] = queue.Queue()
-        self.posted: list[dict] = []
-        self.refuse: dict[str, dict] = {}
-        self.busy = False
-        rendezvous = self
+    async def __aenter__(self):
+        from websockets.asyncio.server import serve
 
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *_):
-                pass
+        self.server = await serve(self.handle, "127.0.0.1", 0)
+        self.port = self.server.sockets[0].getsockname()[1]
+        return self
 
-            def do_GET(self):
-                if self.headers.get("authorization") != "Bearer good":
-                    self.send_response(401)
-                    self.end_headers()
-                    return
-                if self.path == "/api/robot-status":
-                    body = json.dumps(
+    async def __aexit__(self, *_):
+        if self.pc is not None:
+            await self.pc.close()
+        self.server.close()
+        await self.server.wait_closed()
+
+    async def handle(self, ws):
+        await ws.send(json.dumps({"type": "welcome", "peerId": "consumer-1"}))
+        async for raw in ws:
+            message = json.loads(raw)
+            self.received.append(message)
+            kind = message.get("type")
+            if kind == "list":
+                producers = (
+                    [
                         {
-                            "robots": [
-                                {
-                                    "peerId": "duck-peer",
-                                    "meta": {
-                                        "name": "graphite",
-                                        "kind": "microduck",
-                                        "release": "0.9.4",
-                                    },
-                                    "busy": rendezvous.busy,
-                                    "activeApp": "console" if rendezvous.busy else None,
-                                },
-                                {
-                                    "peerId": "mini-peer",
-                                    "meta": {"name": "mini", "kind": "reachy_mini"},
-                                },
-                                {"meta": {"name": "no peer id", "kind": "microduck"}},
-                            ]
+                            "id": "prod-1",
+                            "meta": {"name": "graphite", "serial": "cec2", "release": "0.9.4"},
                         }
-                    ).encode()
-                    self.send_response(200)
-                    self.send_header("content-type", "application/json")
-                    self.send_header("content-length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-                    return
-                self.send_response(200)
-                self.send_header("content-type", "text/event-stream")
-                self.end_headers()
-                # CRLF on purpose: a proxy may rewrite the framing, and the reader must not care.
-                self.wfile.write(
-                    b'data: {"type": "welcome", "peerId": "me", "username": "u"}\r\n\r\n'
+                    ]
+                    if self.producers
+                    else []
                 )
-                self.wfile.flush()
-                try:
-                    while True:
-                        event = rendezvous.events.get()
-                        if event is None:
-                            return
-                        self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
-                        self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
-                    return
+                await ws.send(json.dumps({"type": "list", "producers": producers}))
+            elif kind == "startSession":
+                if self.refuse_session:
+                    await ws.send(json.dumps({"type": "error", "details": "session already open"}))
+                    continue
+                await ws.send(json.dumps({"type": "sessionStarted", "sessionId": "S1"}))
+                await self.offer(ws)
+            elif kind == "peer" and message.get("sdp"):
+                sdp = message["sdp"]
+                await self.pc.setRemoteDescription(RTCSessionDescription(sdp["sdp"], sdp["type"]))
+            elif kind == "endSession":
+                await ws.send(json.dumps({"type": "endSession", "sessionId": "S1"}))
 
-            def do_POST(self):
-                length = int(self.headers.get("content-length") or 0)
-                message = json.loads(self.rfile.read(length) or b"{}")
-                rendezvous.posted.append(message)
-                answer: dict = {"status": "ok"}
-                if message.get("type") == "startSession":
-                    answer = (
-                        {"type": "sessionRejected", "activeApp": "console"}
-                        if rendezvous.busy
-                        else {"type": "sessionStarted", "sessionId": "S1"}
-                    )
-                elif message.get("type") == "peer":
-                    rpc = message["rpc"]
-                    method = rpc["method"]
-                    if method in rendezvous.refuse:
-                        reply = {
-                            "jsonrpc": "2.0",
-                            "id": rpc["id"],
-                            "error": rendezvous.refuse[method],
-                        }
-                    elif method == "media.stream":
-                        params = rpc.get("params") or {}
-                        reply = {
-                            "jsonrpc": "2.0",
-                            "id": rpc["id"],
-                            "result": {"streaming": params.get("url") is not None, **params},
-                        }
-                    elif method == "silent":
-                        reply = None
-                    else:
-                        reply = {"jsonrpc": "2.0", "id": rpc["id"], "result": {"method": method}}
-                    if reply is not None:
-                        # A notification first, which nobody asked for and nothing must break on.
-                        rendezvous.events.put(
-                            {
-                                "type": "peer",
-                                "sessionId": "S1",
-                                "rpc": {"jsonrpc": "2.0", "method": "robot.state", "params": {}},
-                            }
-                        )
-                        rendezvous.events.put({"type": "peer", "sessionId": "S1", "rpc": reply})
-                body = json.dumps(answer).encode()
-                self.send_response(200)
-                self.send_header("content-type", "application/json")
-                self.send_header("content-length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+    async def offer(self, ws):
+        self.pc = RTCPeerConnection()
+        channel = self.pc.createDataChannel("control")
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-        self.base = f"http://127.0.0.1:{self.server.server_port}"
+        @channel.on("message")
+        def on_message(raw):
+            request = json.loads(raw)
+            method = request["method"]
+            if method == "media.video":
+                reply = {
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "error": {"code": -32601, "message": "not here"},
+                }
+            elif method == "silent":
+                return
+            else:
+                reply = {
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": {"echo": request.get("params")},
+                }
+            # A notification first, which nobody asked for and nothing must break on.
+            channel.send(json.dumps({"jsonrpc": "2.0", "method": "robot.state", "params": {}}))
+            channel.send(json.dumps(reply))
 
-    def close(self):
-        self.events.put(None)
-        self.server.shutdown()
-        self.server.server_close()
+        offer = await self.pc.createOffer()
+        await self.pc.setLocalDescription(offer)
+        local = self.pc.localDescription
+        await ws.send(
+            json.dumps(
+                {"type": "peer", "sessionId": "S1", "sdp": {"type": local.type, "sdp": local.sdp}}
+            )
+        )
 
 
-@pytest.fixture
-def rendezvous():
-    fake = FakeRendezvous()
-    yield fake
-    fake.close()
+def run(coroutine):
+    return asyncio.run(asyncio.wait_for(coroutine, 30))
 
 
-def test_the_listing_keeps_ducks_with_a_peer_id(rendezvous):
-    found = robot.ducks("good", base=rendezvous.base)
-    assert [d.name for d in found] == ["graphite"], (
-        "a mini is not a duck, and no peer id is no robot"
-    )
-    assert robot.choose(found, None).peer_id == "duck-peer"
-    assert robot.choose(found, "graphite").peer_id == "duck-peer"
-    with pytest.raises(robot.RobotError, match="no duck called"):
-        robot.choose(found, "onyx")
-    with pytest.raises(robot.RobotError, match="no duck is online"):
-        robot.choose([], None)
+def test_a_call_crosses_the_channel_and_a_refusal_is_a_refusal():
+    async def go():
+        async with FakeMediad() as fake:
+            async with robot.Lane("127.0.0.1", port=fake.port, timeout=5) as lane:
+                assert lane.session_id == "S1"
+                assert lane.producer.name == "graphite" and lane.producer.serial == "cec2"
+                answer = await lane.call("media.stream", {"url": "ws://10.0.0.2:8765/frames"})
+                assert answer == {"echo": {"url": "ws://10.0.0.2:8765/frames"}}
+                with pytest.raises(robot.RpcError, match="not here"):
+                    await lane.call("media.video")
+            kinds = [m["type"] for m in fake.received]
+            assert kinds[:2] == ["list", "startSession"]
+            assert "endSession" in kinds, "closing the lane frees the robot for the next consumer"
+            assert any(m.get("sdp", {}).get("type") == "answer" for m in fake.received)
+
+    run(go())
 
 
-def test_a_bad_token_is_said_plainly(rendezvous):
-    with pytest.raises(robot.RobotError, match="refused this token"):
-        robot.ducks("bad", base=rendezvous.base)
+def test_a_robot_with_no_producer_says_so():
+    async def go():
+        async with FakeMediad(producers=False) as fake:
+            with pytest.raises(robot.RobotError, match="lists no producer"):
+                await robot.Lane("127.0.0.1", port=fake.port).open()
+
+    run(go())
 
 
-def test_a_call_crosses_the_lane_and_a_refusal_is_a_refusal(rendezvous):
-    rendezvous.refuse["media.video"] = {"code": -32601, "message": "not over this lane"}
-    with robot.Lane("good", "duck-peer", base=rendezvous.base, timeout=5) as lane:
-        assert lane.session_id == "S1"
-        answer = lane.call("media.stream", {"url": "ws://10.0.0.2:8765/frames", "encoding": "jpeg"})
-        assert answer["streaming"] is True and answer["url"] == "ws://10.0.0.2:8765/frames"
-        assert lane.call("media.stream", {"url": None}) == {"streaming": False, "url": None}
-        with pytest.raises(robot.RpcError, match="not over this lane"):
-            lane.call("media.video")
+def test_a_refused_session_is_said_plainly():
+    async def go():
+        async with FakeMediad(refuse_session=True) as fake:
+            with pytest.raises(robot.RobotError, match="refused the session"):
+                await robot.Lane("127.0.0.1", port=fake.port).open()
 
-    kinds = [m["type"] for m in rendezvous.posted]
-    assert kinds[:2] == ["setPeerStatus", "startSession"], (
-        "the stream binds the peer; then a session"
-    )
-    assert kinds[-1] == "endSession", "closing the lane ends the session for the next consumer"
-    envelope = next(m for m in rendezvous.posted if m["type"] == "peer")
-    assert envelope["sessionId"] == "S1" and envelope["rpc"]["jsonrpc"] == "2.0"
+    run(go())
 
 
-def test_a_busy_duck_is_refused_before_anything_is_asked(rendezvous):
-    rendezvous.busy = True
-    with pytest.raises(robot.RobotError, match="busy with console"):
-        robot.Lane("good", "duck-peer", base=rendezvous.base).open()
+def test_nothing_listening_is_the_first_diagnosis():
+    async def go():
+        with pytest.raises(robot.RobotError, match="nothing answers at ws://127.0.0.1:1"):
+            await robot.Lane("127.0.0.1", port=1).open()
+
+    run(go())
 
 
-def test_silence_from_the_robot_times_out_with_a_diagnosis(rendezvous):
-    with robot.Lane("good", "duck-peer", base=rendezvous.base, timeout=0.3) as lane:
-        with pytest.raises(robot.RobotError, match="no answer from the robot"):
-            lane.call("silent")
+def test_silence_from_the_robot_times_out():
+    async def go():
+        async with FakeMediad() as fake:
+            async with robot.Lane("127.0.0.1", port=fake.port, timeout=0.3) as lane:
+                with pytest.raises(robot.RobotError, match="no answer from the robot"):
+                    await lane.call("silent")
+
+    run(go())
 
 
-def test_sse_data_joins_lines_and_ignores_comments():
-    assert robot.sse_data(': ping\ndata: {"a":\ndata: 1}') == '{"a":1}'
-    assert robot.sse_data(": ping") == ""
+def test_find_host_takes_what_it_is_given():
+    assert robot.find_host("192.168.10.124") == "192.168.10.124"

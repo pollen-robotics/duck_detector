@@ -1,151 +1,48 @@
-"""Talking to a duck the way the vision-demo Space does: through the Hugging Face rendezvous.
+"""A control channel to a duck on the LAN, the way `duckctl open`'s page gets one.
 
-Every duck that is online holds an outbound stream to `pollen-robotics/reachy-mini-central`, the
-Space the Reachy Mini fleet registers with (`mediad::relay`). That is what `duckctl open` and the
-console page lean on from off the LAN, and it is what this module leans on for everything: which
-ducks this account has, and a control lane to one of them.
+`mediad` runs a WebRTC signalling server on the robot (port 8443, gst-plugins-rs's protocol) and
+opens a `control` datachannel to every peer that negotiates a session. The console page does this
+in a browser; this does it in Python with `aiortc`, and speaks JSON-RPC 2.0 down the channel —
+one object per message, `duck-ipc-proto`'s wire.
 
-**JSON-RPC over the rendezvous, with no WebRTC in the path.** The service forwards every key of a
-`peer` envelope except `type` and `sessionId` to the session partner without reading it, so an
-envelope carrying `rpc` is a control call and `mediad`'s control lane answers it out of the same
-routing table the console's datachannel uses:
+    ws://robot:8443   →  welcome  →  list  →  startSession  →  sessionStarted
+                      ←  peer {sdp: offer}         →  peer {sdp: answer}
+                      ⇄  peer {ice}
+    datachannel "control"  ⇄  {"jsonrpc": "2.0", "id": 1, "method": "media.stream", …}
 
-    POST /send  {"type": "peer", "sessionId": S, "rpc": {"jsonrpc": "2.0", "id": 1, …}}
-    SSE         {"type": "peer", "sessionId": S, "rpc": {"jsonrpc": "2.0", "id": 1, "result": …}}
+Nothing here leaves the LAN and no account is involved: whoever can reach the signalling port can
+drive the robot, which is `mediad`'s documented stance and why `--host` is an address rather than a
+login. The robot also streams its video track to any peer; it is drained and discarded here, since
+the frames a capture wants come the other way (`capture.py`).
 
-This is a port of `spaces/vision-demo/{rendezvous,wire,control}.py` in the robot repository, cut
-down to what a command-line tool needs and moved onto `httpx`, which `huggingface_hub` already
-brings in. The protocol notes that matter are kept as comments where they bite.
+The rendezvous path — the same handshake relayed through a Hugging Face Space — exists in the robot
+repo and worked for the control lane, but media across the internet does not yet, so this tool is
+LAN only on purpose.
 
-What it costs, said once: **one consumer at a time.** The rendezvous's rule, and the robot's own
-console counts — a duck somebody is watching in a browser refuses a second session. And it is not
-a lane for pixels: the frames go point to point (`capture.py`), and only the instruction to send
-them crosses here.
+**One consumer at a time.** `mediad` refuses a second session, so a console open on the robot
+(`duckctl open`) makes it busy, and vice versa.
 """
 
 from __future__ import annotations
 
-import contextlib
+import asyncio
 import itertools
 import json
 import logging
-import os
-import queue
-import threading
-from concurrent.futures import Future
-from concurrent.futures import TimeoutError as FutureTimeout
-from dataclasses import dataclass
+import shutil
+import subprocess
+from dataclasses import dataclass, field
 from typing import Any
-
-import httpx
 
 logger = logging.getLogger(__name__)
 
-# `mediad::relay::DEFAULT_RENDEZVOUS`. The same override the mini's own clients read.
-DEFAULT_RENDEZVOUS = os.environ.get(
-    "REACHY_CENTRAL_URL", "https://pollen-robotics-reachy-mini-central.hf.space"
-).rstrip("/")
-
-# `meta.kind` on the wire: an account with a duck and a mini on it lists both.
-DUCK = "microduck"
-
+SIGNALLING_PORT = 8443
 CONNECT_TIMEOUT = 20.0
-# The SSE stream sends a comment ping every 30 s; appreciably longer than that is a dead stream.
-READ_TIMEOUT = 90.0
+CONTROL_LABEL = "control"
 
 
 class RobotError(Exception):
     """Something the person at the keyboard can act on."""
-
-
-def token() -> str:
-    """The Hugging Face token: `HF_TOKEN`, else what `hf auth login` stored."""
-    from huggingface_hub import get_token
-
-    found = (os.environ.get("HF_TOKEN") or get_token() or "").strip()
-    if not found:
-        raise RobotError("no Hugging Face token: run `hf auth login`, or set HF_TOKEN")
-    return found
-
-
-@dataclass
-class Duck:
-    """One robot as the rendezvous lists it."""
-
-    peer_id: str
-    name: str
-    kind: str | None
-    release: str
-    busy: bool
-    active_app: str | None
-    age: float | None
-
-    @classmethod
-    def parse(cls, entry: dict[str, Any]) -> Duck:
-        meta = entry.get("meta") or {}
-        return cls(
-            peer_id=entry.get("peerId") or entry.get("id") or "",
-            name=meta.get("name") or entry.get("robotName") or "a duck with no name",
-            kind=meta.get("kind"),
-            release=meta.get("release") or "release unknown",
-            busy=bool(entry.get("busy")),
-            # The rendezvous reports the *consumer's* label here — `duckctl open`'s page, or
-            # another capture.
-            active_app=entry.get("activeApp"),
-            age=entry.get("last_seen_age_seconds"),
-        )
-
-    def label(self) -> str:
-        bits = [self.name, self.release]
-        if self.busy:
-            bits.append(f"busy with {self.active_app or 'something'}")
-        if self.age is not None and self.age > 60:
-            bits.append(f"last heard from {self.age / 60:.0f} min ago")
-        return " — ".join(bits)
-
-
-def ducks(hf_token: str, base: str = DEFAULT_RENDEZVOUS) -> list[Duck]:
-    """This account's ducks, online or recently so.
-
-    `GET /api/robot-status` is one `whoami-v2` call and no session: a listing that opened `/events`
-    would supersede a session the same token holds (§3.7 of the design), which is exactly what a
-    tool that is about to open one must not do.
-    """
-    try:
-        answer = httpx.get(
-            f"{base}/api/robot-status",
-            headers={"Authorization": f"Bearer {hf_token}"},
-            timeout=CONNECT_TIMEOUT,
-        )
-    except httpx.HTTPError as e:
-        raise RobotError(f"the rendezvous could not be reached: {e}") from None
-    if answer.status_code == 401:
-        raise RobotError("the rendezvous refused this token — `hf auth login` again")
-    if answer.status_code == 429:
-        raise RobotError("the rendezvous is rate-limiting this token; wait a minute")
-    if answer.status_code != 200:
-        raise RobotError(f"the rendezvous answered HTTP {answer.status_code}: {answer.text[:200]}")
-    listed = answer.json().get("robots") or []
-    return [duck for duck in map(Duck.parse, listed) if duck.peer_id and duck.kind == DUCK]
-
-
-def choose(found: list[Duck], wanted: str | None) -> Duck:
-    """The duck named, or the only one there is."""
-    if wanted:
-        for duck in found:
-            if wanted in (duck.name, duck.peer_id):
-                return duck
-        names = ", ".join(d.name for d in found) or "none online"
-        raise RobotError(f"no duck called {wanted!r} — listed: {names}")
-    if not found:
-        raise RobotError(
-            "no duck is online for this account. A duck registers with the rendezvous as soon as "
-            "it has a network; `duckctl ip` says whether it has one."
-        )
-    if len(found) > 1:
-        names = ", ".join(d.name for d in found)
-        raise RobotError(f"{len(found)} ducks online ({names}); say which with --robot")
-    return found[0]
 
 
 class RpcError(Exception):
@@ -158,227 +55,295 @@ class RpcError(Exception):
         super().__init__(f"{method}: {self.message}")
 
 
-class Lane:
-    """One control-only session with one duck: requests out, answers back, over the rendezvous.
+@dataclass
+class Producer:
+    """The robot as its signalling server lists it, before a session exists.
 
-    Blocking, because a capture has nothing else to do while it waits for an answer. A thread
-    reads the event stream and settles the futures the calls are waiting on.
+    `meta` is what `mediad/src/producer.rs` registers: `name`, `serial`, `release`, `api_version`.
     """
 
-    def __init__(
-        self,
-        hf_token: str,
-        peer_id: str,
-        *,
-        label: str = "duck-detector/capture",
-        base: str = DEFAULT_RENDEZVOUS,
-        timeout: float = 30.0,
-    ):
-        self._token = hf_token
-        self._peer_id = peer_id
-        self._label = label
-        self._base = base.rstrip("/")
+    peer_id: str
+    meta: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def name(self) -> str:
+        return self.meta.get("name") or self.peer_id[:8]
+
+    @property
+    def serial(self) -> str | None:
+        return self.meta.get("serial")
+
+    @property
+    def release(self) -> str | None:
+        return self.meta.get("release")
+
+
+def find_host(host: str | None) -> str:
+    """The address given, else the one `duckctl ip` finds over Bluetooth."""
+    if host:
+        return host
+    if not shutil.which("duckctl"):
+        raise RobotError("no --host, and no `duckctl` on this machine to find one with")
+    logger.info("no --host; asking duckctl over Bluetooth")
+    try:
+        found = subprocess.run(
+            ["duckctl", "ip"], capture_output=True, text=True, timeout=60, check=False
+        )
+    except subprocess.TimeoutExpired:
+        raise RobotError("`duckctl ip` did not answer in a minute; pass --host") from None
+    address = found.stdout.strip().splitlines()[-1] if found.stdout.strip() else ""
+    if found.returncode != 0 or not address:
+        raise RobotError(
+            f"`duckctl ip` found no robot:\n{found.stderr.strip()[-600:]}\nPass --host <address>."
+        )
+    return address
+
+
+class Lane:
+    """One session with one duck: JSON-RPC over its `control` datachannel.
+
+    `async`, because both halves — the signalling socket and the peer connection — are, and so is
+    the capture that uses this. `open` returns once the channel is open, which is the point at
+    which the robot will answer a call.
+    """
+
+    def __init__(self, host: str, *, port: int = SIGNALLING_PORT, timeout: float = 30.0):
+        self.host = host
+        self.port = port
         self.timeout = timeout
-
-        # **Two clients, because the stream holds its connection for the life of the session**
-        # while every call posts from another thread. One shared pool across those two is a stream
-        # that loses messages.
-        self._streaming = httpx.Client(timeout=httpx.Timeout(CONNECT_TIMEOUT, read=READ_TIMEOUT))
-        self._posting = httpx.Client(timeout=CONNECT_TIMEOUT)
-        self._response: httpx.Response | None = None
-        self._thread: threading.Thread | None = None
-        self._stop = threading.Event()
-
-        self._ids = itertools.count(1)
-        self._pending: dict[int, tuple[str, Future]] = {}
-        self._lock = threading.Lock()
-        self._welcome: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+        self.producer: Producer | None = None
         self.session_id: str | None = None
-        self.error: str | None = None
+        self._ws = None
+        self._pc = None
+        self._channel = None
+        self._channel_open: asyncio.Future | None = None
+        self._ids = itertools.count(1)
+        self._pending: dict[int, tuple[str, asyncio.Future]] = {}
+        self._pump: asyncio.Task | None = None
+
+    @property
+    def url(self) -> str:
+        return f"ws://{self.host}:{self.port}"
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
-    def open(self) -> Lane:
-        """Open the stream, register, and ask for a session. Raises `RobotError` when refused."""
-        headers = {"authorization": f"Bearer {self._token}", "accept": "text/event-stream"}
+    async def open(self) -> Lane:
+        from aiortc import RTCPeerConnection
+        from websockets.asyncio.client import connect
+
+        loop = asyncio.get_running_loop()
+        self._channel_open = loop.create_future()
         try:
-            request = self._streaming.build_request("GET", f"{self._base}/events", headers=headers)
-            response = self._streaming.send(request, stream=True)
-        except httpx.HTTPError as e:
-            raise RobotError(f"the rendezvous could not be reached: {e}") from None
-        if response.status_code == 401:
-            raise RobotError("the rendezvous refused this token — `hf auth login` again")
-        if response.status_code != 200:
-            raise RobotError(f"the event stream answered HTTP {response.status_code}")
-        self._response = response
-        self._thread = threading.Thread(target=self._pump, name="duck-lane", daemon=True)
-        self._thread.start()
-
-        try:
-            welcome = self._welcome.get(timeout=CONNECT_TIMEOUT)
-        except queue.Empty:
-            self.close()
-            raise RobotError("the rendezvous accepted the stream and never said hello") from None
-        logger.info("welcome: account %s", welcome.get("username") or "unknown")
-
-        # A name in the listing, so whoever else looks sees what holds the robot.
-        self._post({"type": "setPeerStatus", "roles": ["listener"], "meta": {"name": self._label}})
-
-        # **`startSession`'s answer is in the POST body**, not on the stream — the one shape a
-        # reader of this protocol gets wrong once. Nothing about the session commits either end to
-        # WebRTC: no offer is sent, and the control lane needs none.
-        answer = self._post({"type": "startSession", "peerId": self._peer_id}) or {}
-        kind = answer.get("type")
-        if kind == "sessionRejected":
-            self.close()
+            self._ws = await asyncio.wait_for(connect(self.url), CONNECT_TIMEOUT)
+        except (OSError, TimeoutError) as e:
             raise RobotError(
-                f"this duck is busy with {answer.get('activeApp') or 'something else'} — one "
-                "consumer at a time, and a console open on it (`duckctl open`) counts"
-            )
-        if kind != "sessionStarted":
-            self.close()
-            raise RobotError(f"`startSession` answered {answer!r} rather than a session")
-        self.session_id = answer.get("sessionId")
-        logger.info("session %s open, control only", (self.session_id or "?")[:8])
-        return self
+                f"nothing answers at {self.url}: {e}. That is mediad's signalling port — is the "
+                "robot on, and on this network? `duckctl ip` says where it is."
+            ) from None
 
-    def close(self) -> None:
-        self._stop.set()
-        if self.session_id:
-            with contextlib.suppress(RobotError):
-                self._post({"type": "endSession", "sessionId": self.session_id})
+        try:
+            welcome = await self._expect("welcome")
+            logger.info("welcome: peer %s", (welcome.get("peerId") or "?")[:8])
+            await self._send({"type": "list"})
+            listing = await self._expect("list")
+            producers = [
+                Producer(p["id"], p.get("meta") or {}) for p in listing.get("producers") or []
+            ]
+            if not producers:
+                raise RobotError(
+                    f"{self.url} lists no producer. mediad registers one when its pipeline is "
+                    "playing — `journalctl -u mediad -b` on the robot says why it is not."
+                )
+            self.producer = producers[0]
+            logger.info("producer: %s %s", self.producer.name, json.dumps(self.producer.meta))
+
+            # No offer from us: the producer offers, because it knows what it is sending.
+            self._pc = RTCPeerConnection()
+            self._pc.on("datachannel", self._on_datachannel)
+            self._pc.on("track", self._on_track)
+            await self._send({"type": "startSession", "peerId": self.producer.peer_id})
+            started = await self._expect("sessionStarted", also=("sessionRejected", "error"))
+            if started.get("type") != "sessionStarted":
+                raise RobotError(
+                    f"{self.producer.name} refused the session: "
+                    f"{started.get('details') or started.get('reason') or started}. One consumer "
+                    "at a time — a console open on it (`duckctl open`) counts."
+                )
+            self.session_id = started.get("sessionId")
+
+            self._pump = asyncio.ensure_future(self._read_signalling())
+            try:
+                await asyncio.wait_for(asyncio.shield(self._channel_open), CONNECT_TIMEOUT)
+            except TimeoutError:
+                raise RobotError(
+                    "the session opened and the control channel never did. ICE failed between "
+                    f"this machine and {self.host}: a firewall, or two networks that route to "
+                    "each other but not for UDP."
+                ) from None
+            return self
+        except BaseException:
+            await self.close()
+            raise
+
+    async def close(self) -> None:
+        if self._pump is not None:
+            self._pump.cancel()
+            self._pump = None
+        if self._ws is not None and self.session_id:
+            try:
+                await self._send({"type": "endSession", "sessionId": self.session_id})
+            except Exception:  # noqa: BLE001 - a teardown that cannot be delivered still ends
+                pass
         self.session_id = None
-        if self._response is not None:
-            self._response.close()
-            self._response = None
-        self._streaming.close()
-        self._posting.close()
+        if self._pc is not None:
+            await self._pc.close()
+            self._pc = None
+        if self._ws is not None:
+            await self._ws.close()
+            self._ws = None
         self._abandon("the lane was closed")
 
-    def __enter__(self) -> Lane:
-        return self.open()
+    async def __aenter__(self) -> Lane:
+        return await self.open()
 
-    def __exit__(self, *_: object) -> None:
-        self.close()
+    async def __aexit__(self, *_: object) -> None:
+        await self.close()
 
     # ── calls ────────────────────────────────────────────────────────────────
 
-    def call(self, method: str, params: dict[str, Any] | None = None, timeout: float | None = None):
+    async def call(self, method: str, params: dict[str, Any] | None = None) -> Any:
         """One request, one answer. `RpcError` is the robot saying no; `RobotError` is no robot."""
-        if not self.session_id:
-            raise RobotError("no session — the lane is not open")
+        if self._channel is None or self._channel.readyState != "open":
+            raise RobotError(f"{method}: no control channel")
         call_id = next(self._ids)
-        future: Future = Future()
-        with self._lock:
-            self._pending[call_id] = (method, future)
-        envelope = {"jsonrpc": "2.0", "id": call_id, "method": method, "params": params or {}}
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending[call_id] = (method, future)
         logger.info("→ %s %s", method, json.dumps(params or {}))
+        self._channel.send(
+            json.dumps({"jsonrpc": "2.0", "id": call_id, "method": method, "params": params or {}})
+        )
         try:
-            self._post({"type": "peer", "sessionId": self.session_id, "rpc": envelope})
-        except RobotError:
-            with self._lock:
-                self._pending.pop(call_id, None)
-            raise
-        try:
-            return future.result(timeout=self.timeout if timeout is None else timeout)
-        except FutureTimeout:
-            with self._lock:
-                self._pending.pop(call_id, None)
-            raise RobotError(
-                f"{method}: no answer from the robot. The session opened, so it is listening; "
-                "a `mediad` from before the control lane drops these envelopes silently — update "
-                "the robot."
-            ) from None
+            return await asyncio.wait_for(future, self.timeout)
+        except TimeoutError:
+            self._pending.pop(call_id, None)
+            raise RobotError(f"{method}: no answer from the robot in {self.timeout:.0f}s") from None
 
-    def _post(self, message: dict[str, Any]) -> dict[str, Any] | None:
-        try:
-            answer = self._posting.post(
-                f"{self._base}/send",
-                headers={"authorization": f"Bearer {self._token}"},
-                json=message,
-            )
-        except httpx.HTTPError as e:
-            raise RobotError(f"POST /send: {e}") from None
-        if answer.status_code == 429:
-            raise RobotError("the rendezvous is rate-limiting this token (1200 requests a minute)")
-        if answer.status_code == 400:
-            raise RobotError("the rendezvous says this peer does not exist — its stream is gone")
-        if answer.status_code != 200:
-            raise RobotError(f"POST /send answered HTTP {answer.status_code}: {answer.text[:200]}")
-        try:
-            body = answer.json()
-        except ValueError:
-            return None
-        return body if isinstance(body, dict) and body.get("type") else None
+    # ── the wire ─────────────────────────────────────────────────────────────
 
-    # ── the stream ───────────────────────────────────────────────────────────
+    async def _send(self, message: dict[str, Any]) -> None:
+        logger.debug("→ signalling %s", json.dumps(message)[:200])
+        await self._ws.send(json.dumps(message))
 
-    def _pump(self) -> None:
-        """Read SSE frames and dispatch them. CRLF normalised: the framing is a proxy's."""
-        assert self._response is not None
-        buffer = ""
+    async def _receive(self) -> dict[str, Any]:
+        raw = await asyncio.wait_for(self._ws.recv(), CONNECT_TIMEOUT)
+        message = json.loads(raw)
+        if message.get("type") != "peerStatusChanged":
+            logger.debug("← signalling %s", raw[:200])
+        return message
+
+    async def _expect(self, kind: str, also: tuple[str, ...] = ()) -> dict[str, Any]:
+        """The next message of one of these kinds, skipping the status chatter the server pushes."""
         try:
-            for chunk in self._response.iter_text():
-                if self._stop.is_set():
+            while True:
+                message = await self._receive()
+                if message.get("type") in (kind, *also):
+                    return message
+        except TimeoutError:
+            raise RobotError(f"{self.url} never sent {kind!r}") from None
+
+    async def _read_signalling(self) -> None:
+        """After the session: offers and candidates in, answers and candidates out."""
+        from aiortc.sdp import candidate_from_sdp
+
+        try:
+            while True:
+                message = json.loads(await self._ws.recv())
+                kind = message.get("type")
+                if kind == "peer" and message.get("sdp"):
+                    await self._answer(message["sdp"])
+                elif kind == "peer" and message.get("ice"):
+                    ice = message["ice"]
+                    candidate = candidate_from_sdp(ice["candidate"].removeprefix("candidate:"))
+                    candidate.sdpMLineIndex = ice.get("sdpMLineIndex")
+                    await self._pc.addIceCandidate(candidate)
+                elif kind == "endSession":
+                    self.session_id = None
+                    self._abandon("the robot ended the session")
                     return
-                buffer += chunk.replace("\r\n", "\n")
-                while "\n\n" in buffer:
-                    frame, _, buffer = buffer.partition("\n\n")
-                    data = sse_data(frame)
-                    if data:
-                        self._handle(data)
-        except Exception as e:  # noqa: BLE001 - closing the response mid-read raises anything
-            if not self._stop.is_set():
-                self.error = f"the event stream failed: {type(e).__name__}: {e}"
-                logger.warning("%s", self.error)
-        finally:
-            if not self._stop.is_set():
-                self._abandon(self.error or "the rendezvous closed the event stream")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - the socket closing mid-read raises anything
+            self._abandon(f"the signalling socket failed: {type(e).__name__}: {e}")
 
-    def _handle(self, data: str) -> None:
+    async def _answer(self, offer: dict[str, Any]) -> None:
+        from aiortc import RTCSessionDescription
+
+        await self._pc.setRemoteDescription(RTCSessionDescription(offer["sdp"], offer["type"]))
+        answer = await self._pc.createAnswer()
+        # `setLocalDescription` gathers ICE before it returns, so the answer carries every
+        # candidate and nothing needs trickling from this side.
+        await self._pc.setLocalDescription(answer)
+        local = self._pc.localDescription
+        await self._send(
+            {
+                "type": "peer",
+                "sessionId": self.session_id,
+                "sdp": {"type": local.type, "sdp": local.sdp},
+            }
+        )
+
+    def _on_datachannel(self, channel) -> None:
+        logger.info("datachannel: %s", channel.label)
+        if channel.label != CONTROL_LABEL:
+            return
+        self._channel = channel
+        channel.on("message", self._on_message)
+        channel.on("close", lambda: self._abandon("the control channel closed"))
+        if channel.readyState == "open":
+            self._opened()
+        else:
+            channel.on("open", self._opened)
+
+    def _opened(self) -> None:
+        if self._channel_open is not None and not self._channel_open.done():
+            self._channel_open.set_result(True)
+
+    def _on_track(self, track) -> None:
+        # The video the console would show. Drained so aiortc's decoder queue does not grow
+        # without bound; the frames a capture wants arrive by `media.stream`, not here.
+        async def drain() -> None:
+            try:
+                while True:
+                    await track.recv()
+            except Exception:  # noqa: BLE001 - the track ending is the only way out
+                pass
+
+        asyncio.ensure_future(drain())
+
+    def _on_message(self, raw: Any) -> None:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
         try:
-            message = json.loads(data)
+            message = json.loads(raw)
         except ValueError:
             return
-        kind = message.get("type")
-        if kind == "welcome":
-            with contextlib.suppress(queue.Full):
-                self._welcome.put_nowait(message)
-        elif kind == "peer":
-            payload = message.get("rpc")
-            # An `sdp` or `ice` is the robot's media path answering a negotiation this lane never
-            # started; not an error, and nothing here can use it.
-            if isinstance(payload, dict):
-                self._settle(payload)
-        elif kind in ("endSession", "sessionRejected"):
-            self.session_id = None
-            self._abandon(f"the session ended: {message.get('reason') or 'no reason given'}")
-
-    def _settle(self, payload: dict[str, Any]) -> None:
-        call_id = payload.get("id")
+        call_id = message.get("id")
         if call_id is None:
-            # A notification — `robot.state`, `media.detections`. Nobody here asked for one.
+            # `robot.state`, `media.detections`, `media.video`: notifications nobody here asked for.
             return
-        with self._lock:
-            waiting = self._pending.pop(call_id, None)
+        waiting = self._pending.pop(call_id, None)
         if waiting is None:
             return
         method, future = waiting
-        if "error" in payload:
-            future.set_exception(RpcError(method, payload.get("error") or {}))
+        if future.done():
+            return
+        if "error" in message:
+            future.set_exception(RpcError(method, message.get("error") or {}))
         else:
-            future.set_result(payload.get("result"))
+            future.set_result(message.get("result"))
 
     def _abandon(self, why: str) -> None:
-        with self._lock:
-            pending, self._pending = self._pending, {}
+        pending, self._pending = self._pending, {}
         for method, future in pending.values():
             if not future.done():
                 future.set_exception(RobotError(f"{method}: {why}"))
-
-
-def sse_data(frame: str) -> str:
-    """The `data:` payload of one server-sent event, joined across lines."""
-    return "".join(
-        line[len("data:") :].strip() for line in frame.split("\n") if line.startswith("data:")
-    )

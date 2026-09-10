@@ -29,17 +29,17 @@ HELLO = {
 class FakeLane:
     """Answers `media.stream` the way `mediad` does, and remembers what it was asked."""
 
+    producer = robot.Producer("prod-1", {"name": "graphite", "serial": "cec2", "release": "0.9.4"})
+
     def __init__(self, dial):
         self.calls = []
         self.dial = dial
-        self.loop = None
 
-    def call(self, method, params=None):
-        # Called off the event loop's thread (`asyncio.to_thread`), as the real lane is.
+    async def call(self, method, params=None):
         self.calls.append((method, params))
         if params and params.get("url"):
             # The robot dials the url it was given, from another task.
-            self.loop.call_soon_threadsafe(lambda: asyncio.ensure_future(self.dial(params["url"])))
+            asyncio.ensure_future(self.dial(params["url"]))
             return {"streaming": True, "url": params["url"]}
         if params is not None and params.get("url", "x") is None:
             return {"streaming": False}
@@ -74,23 +74,8 @@ def args(tmp_path, **over):
     return SimpleNamespace(**base)
 
 
-DUCK = robot.Duck(
-    peer_id="p1",
-    name="graphite",
-    kind="microduck",
-    release="0.9.4",
-    busy=False,
-    active_app=None,
-    age=1.0,
-)
-
-
-def go(a, lane, duck, out):
-    async def main():
-        lane.loop = asyncio.get_running_loop()
-        await capture.run(a, lane, duck, out)
-
-    asyncio.run(main())
+def go(a, lane, out):
+    asyncio.run(capture.run(a, lane, out))
 
 
 def free_port() -> int:
@@ -110,7 +95,7 @@ def test_a_session_is_captured_off_the_stream_and_the_stream_is_stopped(tmp_path
     lane = FakeLane(lambda url: fake_duck(url, frames=10))
     a = args(tmp_path, port=free_port())
     out = {}
-    go(a, lane, DUCK, out)
+    go(a, lane, out)
 
     directory = out["dir"]
     assert directory.name.endswith("_kitchen_graphite")
@@ -119,7 +104,7 @@ def test_a_session_is_captured_off_the_stream_and_the_stream_is_stopped(tmp_path
 
     record = json.loads((directory / "session.json").read_text())
     assert record["robot"] == "graphite"
-    assert record["serial"] == "cec2b3808a7238ff"
+    assert record["serial"] == "cec2b3808a7238ff", "the hello wins over the producer meta"
     assert record["frames"] == 4
     assert (record["width"], record["height"]) == (72, 128)
     # Upright already, and the record says so — the one field that would cost an afternoon.
@@ -143,7 +128,7 @@ def test_a_robot_that_never_dials_is_reported_with_its_own_view(tmp_path, monkey
 
     lane = FakeLane(nobody)
     with pytest.raises(robot.RobotError) as raised:
-        go(args(tmp_path, port=free_port()), lane, DUCK, {})
+        go(args(tmp_path, port=free_port()), lane, {})
     message = str(raised.value)
     assert "never dialled ws://127.0.0.1:" in message
     assert '"reconnects": 3' in message, "the robot's own counters are the diagnosis"
@@ -156,7 +141,7 @@ def test_the_wrong_encoding_is_refused_rather_than_written(tmp_path):
     hello = {**HELLO, "frames": {**HELLO["frames"], "encoding": "h264"}}
     lane = FakeLane(lambda url: fake_duck(url, frames=3, hello=hello))
     with pytest.raises(robot.RobotError, match="h264"):
-        go(args(tmp_path, port=free_port()), lane, DUCK, {})
+        go(args(tmp_path, port=free_port()), lane, {})
 
 
 def test_the_session_record_round_trips(tmp_path):
