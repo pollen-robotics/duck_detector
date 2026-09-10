@@ -1,14 +1,24 @@
-"""Pull a session of stills off a Microduck's own camera.
+"""Pull a session of stills off a Microduck's own camera, without touching the robot.
 
 The dataset has to come from *this* camera: a wide lens 20 cm off the floor, an ISP with its own
 colour, and a picture the daemon turns a quarter turn before anything sees it. Frames scraped from
 anywhere else train a detector for a camera nobody has.
 
-    uv run capture --host microduck@192.168.10.124 --seconds 120 --tag kitchen-afternoon
+    uv run capture --tag kitchen-afternoon --seconds 120
 
-What it does, in order: check the board can capture, stop `mediad` (V4L2 is exclusive and it holds
-the camera), capture, pull the frames back, start `mediad` again, and write a `session.json` beside
-them. Nothing is installed on the robot — the capture script goes over ssh on stdin.
+**Nothing is stopped and nothing is installed.** `mediad` holds the camera and keeps holding it:
+this asks it for `media.stream`, the same call the vision-demo Space makes, and the robot dials a
+WebSocket this tool opens on the laptop and pushes JPEG frames down it — upright, at the rate asked
+for, straight off the tee that already feeds the console's video. It is `duckctl open` with a
+program on the far end instead of a browser, and it means the console's picture and the robot's
+own duck detector are what the dataset is captured through, by construction.
+
+    laptop ──media.stream {url: "ws://192.168.10.42:8765/frames"}──► rendezvous ──► robot
+    robot  ═══════════════ JPEG frames, LAN, direct ═══════════════════════════► laptop
+
+The instruction crosses the Hugging Face rendezvous (`robot.py`); the pixels do not. The robot has
+to be able to reach the laptop — same LAN, or an address the laptop is reachable at — and
+`--advertise` names that address when the guess is wrong.
 
 **Sessions are the unit, not frames.** Two frames half a second apart are the same picture for
 training purposes, so a split that mixes them across train and val reports a score the model has
@@ -19,22 +29,31 @@ makes a session findable when the model turns out to be bad at one kind of room.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
-import shlex
-import subprocess
+import logging
+import socket
 import sys
-from dataclasses import asdict, dataclass
+import time
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from fractions import Fraction
-from importlib import resources
 from pathlib import Path
+from typing import Any
 
-# Where a pulled session lands. Not in the repo — see .gitignore.
+from duck_detector import robot
+
+# Where a pulled session lands. Not in the repo — see .gitignore — but on the Hub, see `hub.py`.
 DEFAULT_ROOT = Path("datasets/raw")
 
-# The quarter turn `mediad` applies before its tee, so what we capture matches what a model will
-# be handed at inference. Keep in step with `mediad --rotate` (default 90).
-DEFAULT_FLIP = "90r"
+# The upright frame is 720 wide and 1280 tall; `longest` is a downscale-only cap, so this asks for
+# every pixel the camera has. The console streams at 640 because a browser does not want more.
+DEFAULT_LONGEST = 1280
+DEFAULT_PORT = 8765
+
+# How long the robot gets to dial us after it accepted `media.stream`. It redials on a backoff
+# starting at 2 s, so this is several attempts — and a robot that has not arrived by then is on a
+# network that cannot reach this laptop, which is what the message says.
+HELLO_TIMEOUT = 25.0
 
 
 @dataclass
@@ -43,7 +62,6 @@ class Session:
 
     session: str
     tag: str
-    host: str
     robot: str | None
     serial: str | None
     frames: int
@@ -51,172 +69,250 @@ class Session:
     seconds: int
     width: int
     height: int
-    flip: str
+    # Frames arrive upright: `mediad` turns them by the mount angle before its tee, and the hello
+    # says `rotate: 0` about what it sends. Recorded so a session from a robot mounted otherwise is
+    # a different domain that can be told apart, rather than a mystery.
+    rotate: int
+    mount_rotate: int | None
     started_utc: str
     release: str | None
     note: str
+    transport: str = "media.stream"
+    longest: int = DEFAULT_LONGEST
+    quality: int = 90
+    hello: dict[str, Any] = field(default_factory=dict)
 
     def write(self, path: Path) -> None:
         path.write_text(json.dumps(asdict(self), indent=2) + "\n")
 
 
-def ssh(host: str, command: str, *, check: bool = True, quiet: bool = False) -> str:
-    """Run one command on the robot and return its stdout."""
-    result = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", host, command],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0 and check:
-        raise SystemExit(
-            f"ssh {host}: `{command}` failed ({result.returncode})\n{result.stderr.strip()}"
-        )
-    if result.stderr.strip() and not quiet:
-        print(result.stderr.strip(), file=sys.stderr)
-    return result.stdout.strip()
+def lan_address(probe: str = "1.1.1.1") -> str:
+    """The address this machine is reachable at from the network it talks to the world on.
 
-
-def robot_identity(host: str) -> tuple[str | None, str | None, str | None]:
-    """The robot's name, serial and release, for the session record.
-
-    All three are `None` on a board where `robotctl` cannot answer — a capture from a robot whose
-    daemons are down is still a good capture, and refusing it over a missing label would be silly.
+    No packet is sent: connecting a UDP socket only picks the interface the kernel would route
+    through, and reading its name back is the one portable way to ask "which of my addresses is
+    the LAN one". Wrong on a machine with two LANs, which is what `--advertise` is for.
     """
-    raw = ssh(host, "robotctl system info --json 2>/dev/null || true", check=False, quiet=True)
-    name = serial = None
-    if raw:
-        try:
-            info = json.loads(raw)
-            name, serial = info.get("name"), info.get("serial")
-        except json.JSONDecodeError:
-            pass
-    release = ssh(
-        host,
-        "readlink /opt/robot/daemon/current 2>/dev/null | sed 's|releases/||' || true",
-        check=False,
-        quiet=True,
-    )
-    return name, serial, release or None
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe_socket:
+        probe_socket.connect((probe, 80))
+        return probe_socket.getsockname()[0]
 
 
-def capture(args: argparse.Namespace) -> Path:
+class Receiver:
+    """The far end of `media.stream`: one hello, then a JPEG per message, written as they land."""
+
+    def __init__(self, directory: Path, *, limit: int | None = None):
+        self.directory = directory
+        self.limit = limit
+        self.hello: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self.done = asyncio.Event()
+        self.frames = 0
+        self.bytes = 0
+        self.connections = 0
+        self.first_at: float | None = None
+        self.last_at: float | None = None
+
+    async def handle(self, connection) -> None:
+        """One robot's connection. A redial after a hiccup is a second; the numbering goes on."""
+        self.connections += 1
+        async for message in connection:
+            if isinstance(message, str):
+                # **What is coming, before any of it arrives**: the robot's name, the encoding, the
+                # size. Kept whole in `session.json` — it is the provenance of every frame after it.
+                try:
+                    hello = json.loads(message)
+                except ValueError:
+                    continue
+                encoding = (hello.get("frames") or {}).get("encoding")
+                if encoding not in (None, "jpeg"):
+                    if not self.hello.done():
+                        self.hello.set_exception(
+                            robot.RobotError(
+                                f"the robot is sending {encoding}, and this tool asked for jpeg"
+                            )
+                        )
+                    return
+                if not self.hello.done():
+                    self.hello.set_result(hello)
+                continue
+            now = time.monotonic()
+            self.first_at = self.first_at or now
+            self.last_at = now
+            (self.directory / f"frame_{self.frames:05d}.jpg").write_bytes(message)
+            self.frames += 1
+            self.bytes += len(message)
+            if self.frames % 10 == 0:
+                rate = (self.frames - 1) / max(now - self.first_at, 1e-6)
+                print(f"   {self.frames} frames, {rate:.1f}/s", file=sys.stderr, end="\r")
+            if self.limit is not None and self.frames >= self.limit:
+                self.done.set()
+                return
+
+
+def image_size(path: Path) -> tuple[int, int]:
+    from PIL import Image
+
+    with Image.open(path) as image:
+        return image.width, image.height
+
+
+async def run(args: argparse.Namespace, lane: robot.Lane, duck: robot.Duck, out: dict) -> Path:
+    from websockets.asyncio.server import serve
+
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    # Asked of the robot, so a session record says which duck was looking — skipped on a dry run,
-    # which must reach nothing.
-    name, serial, release = (None, None, None) if args.dry_run else robot_identity(args.host)
-    session = f"{stamp}_{args.tag}_{name or 'unknown'}"
-    remote_dir = f"/var/tmp/duck-capture/{session}"
+    session = f"{stamp}_{args.tag}_{duck.name}"
     local_dir = Path(args.root) / session
-
-    script = resources.files("duck_detector").joinpath("robot_capture.sh").read_text()
-    remote_script = f"/var/tmp/duck-capture-{stamp}.sh"
-    # `framerate=2.0/1` is not a caps value GStreamer will negotiate, so the rate travels as a
-    # fraction — which also buys `--hz 0.5`, one frame every two seconds, for a long slow walk.
-    rate = Fraction(args.hz).limit_denominator(100)
-    env = {
-        "DIR": remote_dir,
-        "SECONDS_": str(args.seconds),
-        "HZ_NUM": str(rate.numerator),
-        "HZ_DEN": str(rate.denominator),
-        "WIDTH": str(args.width),
-        "HEIGHT": str(args.height),
-        "FLIP": args.flip,
-        "DEVICE": args.device,
-        "QUALITY": str(args.quality),
-    }
-    exports = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
-
-    print(f"== {session}: {args.seconds}s at {args.hz} Hz from {args.host}", file=sys.stderr)
-    if args.dry_run:
-        print(f"would run on {args.host}:\n  env {exports} sh -s", file=sys.stderr)
-        return local_dir
-
-    # **The script goes over first, rather than down stdin.** It needs `sudo` to stop `mediad`, and
-    # a board without a NOPASSWD rule then has a password to ask for — which needs a terminal, the
-    # way the robot's own `dev-push.sh` and `provision-board.sh` ask for it. A script on stdin and
-    # an interactive prompt cannot both have one, so: copy, then run with `-t`.
-    # `cat` rather than `scp -`: scp has no stdin source, and this step wants no terminal — the
-    # script is the stdin, and nothing here calls sudo.
-    subprocess.run(
-        ["ssh", args.host, f"cat > {shlex.quote(remote_script)}"],
-        input=script,
-        text=True,
-        check=True,
-    )
-    # **Nothing is captured here, and that is the point.** `sudo` writes its prompt to the
-    # terminal ssh gave it; capturing that puts the prompt in a pipe, so the password is asked for
-    # somewhere nobody can see it and the capture hangs forever waiting to be told. This inherits
-    # the terminal instead — the prompt shows, the progress lines show, and Ctrl-C reaches the
-    # robot, whose trap puts `mediad` back.
-    result = subprocess.run(
-        ["ssh", "-t", args.host, f"env {exports} sh {remote_script}"],
-        check=False,
-    )
-    ssh(args.host, f"rm -f {shlex.quote(remote_script)}", check=False, quiet=True)
-    if result.returncode != 0:
-        raise SystemExit(f"capture failed on {args.host} ({result.returncode})")
     local_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["rsync", "-a", "--remove-source-files", f"{args.host}:{remote_dir}/", f"{local_dir}/"],
-        check=True,
-    )
-    ssh(args.host, f"rmdir {shlex.quote(remote_dir)} 2>/dev/null || true", check=False, quiet=True)
+    # Handed back through `out` rather than returned: a Ctrl-C cancels this task, and `asyncio.run`
+    # then re-raises `KeyboardInterrupt` after it has finished — the return value never arrives.
+    out["dir"] = local_dir
 
-    # Counted here rather than parsed out of the robot's output: the frames are the truth, and a
-    # number scraped from a terminal that also carried a password prompt is not.
-    frames = len(list(local_dir.glob("frame_*.jpg")))
-    if frames == 0:
-        raise SystemExit(f"no frames arrived in {local_dir}")
+    limit = round(args.hz * args.seconds) if args.seconds else None
+    receiver = Receiver(local_dir, limit=limit)
+    advertise = args.advertise or lan_address()
+    request = {
+        "url": f"ws://{advertise}:{args.port}/frames",
+        "encoding": "jpeg",
+        "fps": args.hz,
+        "longest": args.longest,
+        "quality": args.quality,
+    }
+    print(f"== {session}: {args.seconds or '∞'}s at {args.hz} Hz from {duck.name}", file=sys.stderr)
 
+    async with serve(receiver.handle, "0.0.0.0", args.port):
+        answer = await asyncio.to_thread(lane.call, "media.stream", request)
+        print(f"== media.stream accepted: {json.dumps(answer)}", file=sys.stderr)
+        try:
+            try:
+                hello = await asyncio.wait_for(asyncio.shield(receiver.hello), HELLO_TIMEOUT)
+            except TimeoutError:
+                status = await asyncio.to_thread(lane.call, "media.stream")
+                raise robot.RobotError(
+                    f"the robot accepted the stream and never dialled {request['url']} "
+                    f"(its view: {json.dumps(status)}). It has to reach this laptop: same "
+                    "network, no firewall on the port, and --advertise <ip> if the address "
+                    "above is not the one it should use."
+                ) from None
+            frames = hello.get("frames") or {}
+            print(
+                f"== hello from {(hello.get('robot') or {}).get('name')}: "
+                f"{frames.get('encoding')}, "
+                f"longest {frames.get('longest')}, {frames.get('fps')} fps",
+                file=sys.stderr,
+            )
+            # Stopped by the frame count when there is one, else by Ctrl-C. `wait_for` on the
+            # event rather than a sleep, so a slow robot still delivers `--seconds` worth.
+            if limit is None:
+                await receiver.done.wait()
+            else:
+                await asyncio.wait_for(receiver.done.wait(), timeout=args.seconds * 2 + 30)
+        except (asyncio.CancelledError, KeyboardInterrupt, TimeoutError):
+            print("\n== stopping", file=sys.stderr)
+        finally:
+            # **The stream is stopped whatever happened above**, including Ctrl-C: a robot left
+            # streaming JPEGs at a laptop that has gone is a robot spending a core on nobody, and
+            # redialling every 30 s until somebody notices.
+            try:
+                await asyncio.to_thread(lane.call, "media.stream", {"url": None})
+            except (robot.RobotError, robot.RpcError) as e:
+                print(f"== could not stop the stream: {e}", file=sys.stderr)
+
+    print(file=sys.stderr)
+    if receiver.frames == 0:
+        raise robot.RobotError(f"no frames arrived in {local_dir}")
+    width, height = image_size(local_dir / "frame_00000.jpg")
+    info = receiver.hello.result().get("robot") or {}
+    frames_info = receiver.hello.result().get("frames") or {}
     Session(
         session=session,
         tag=args.tag,
-        host=args.host,
-        robot=name,
-        serial=serial,
-        frames=frames,
+        robot=info.get("name") or duck.name,
+        serial=info.get("serial"),
+        frames=receiver.frames,
         hz=args.hz,
         seconds=args.seconds,
-        width=args.width,
-        height=args.height,
-        flip=args.flip,
+        width=width,
+        height=height,
+        rotate=int(frames_info.get("rotate") or 0),
+        mount_rotate=frames_info.get("mount_rotate"),
         started_utc=stamp,
-        release=release,
+        release=info.get("release") or duck.release,
         note=args.note,
+        longest=args.longest,
+        quality=args.quality,
+        hello=receiver.hello.result(),
     ).write(local_dir / "session.json")
 
-    print(f"== {frames} frames in {local_dir}", file=sys.stderr)
+    span = (receiver.last_at or 0) - (receiver.first_at or 0)
+    rate = (receiver.frames - 1) / span if receiver.frames > 1 and span > 0 else 0.0
+    print(
+        f"== {receiver.frames} frames ({receiver.bytes / 1e6:.1f} MB, {rate:.1f}/s, "
+        f"{width}x{height}) in {local_dir}",
+        file=sys.stderr,
+    )
     return local_dir
+
+
+def capture(args: argparse.Namespace) -> Path:
+    hf_token = robot.token()
+    duck = robot.choose(robot.ducks(hf_token), args.robot)
+    print(f"== {duck.label()}", file=sys.stderr)
+    if duck.busy:
+        raise robot.RobotError(
+            f"{duck.name} is busy with {duck.active_app or 'another consumer'} — close the "
+            "console on it, or wait for the other capture"
+        )
+    if args.dry_run:
+        print(
+            f"would ask {duck.name} to stream jpeg at {args.hz} fps, longest {args.longest}, to "
+            f"ws://{args.advertise or lan_address()}:{args.port}/frames",
+            file=sys.stderr,
+        )
+        return Path(args.root)
+
+    out: dict[str, Path] = {}
+    with robot.Lane(hf_token, duck.peer_id) as lane:
+        try:
+            asyncio.run(run(args, lane, duck, out))
+        except KeyboardInterrupt:
+            pass
+    return out["dir"]
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Capture a labelling session from a Microduck's camera.",
+        description="Capture a labelling session from a Microduck's camera, over its own stream.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--host", required=True, help="user@address of the robot doing the looking")
     parser.add_argument(
         "--tag",
         required=True,
         help="what makes this session different: the room, the light, what is in front of it",
     )
-    parser.add_argument("--seconds", type=int, default=60)
-    parser.add_argument("--hz", type=float, default=2.0, help="frames kept per second")
-    parser.add_argument("--width", type=int, default=1280)
-    parser.add_argument("--height", type=int, default=720)
-    parser.add_argument(
-        "--flip",
-        default=DEFAULT_FLIP,
-        choices=["90r", "180", "90l", "identity"],
-        help="must match `mediad --rotate` or the dataset is sideways",
-    )
-    parser.add_argument("--device", default="/dev/video0")
-    parser.add_argument("--quality", type=int, default=90)
+    parser.add_argument("--robot", help="which duck, by name; needed when more than one is online")
+    parser.add_argument("--seconds", type=int, default=60, help="0 to run until Ctrl-C")
+    parser.add_argument("--hz", type=float, default=2.0, help="frames per second (0.2 to 15)")
+    parser.add_argument("--longest", type=int, default=DEFAULT_LONGEST, help="longest side, px")
+    parser.add_argument("--quality", type=int, default=90, help="JPEG quality on the robot")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="where the robot dials in")
+    parser.add_argument("--advertise", help="this laptop's address as the robot sees it")
     parser.add_argument("--root", default=str(DEFAULT_ROOT))
     parser.add_argument("--note", default="", help="anything worth remembering about this session")
-    parser.add_argument("--dry-run", action="store_true", help="print what would run, do nothing")
-    capture(parser.parse_args())
+    parser.add_argument("--push", action="store_true", help="upload the session to the Hub after")
+    parser.add_argument("--dry-run", action="store_true", help="find the duck, stream nothing")
+    parser.add_argument("-v", "--verbose", action="store_true", help="log the rendezvous traffic")
+    args = parser.parse_args()
+    if args.verbose:
+        logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
+
+    try:
+        local_dir = capture(args)
+    except (robot.RobotError, robot.RpcError) as e:
+        raise SystemExit(f"capture: {e}") from None
+    if args.push and not args.dry_run:
+        from duck_detector import hub
+
+        hub.push_sessions([local_dir.name])
 
 
 if __name__ == "__main__":

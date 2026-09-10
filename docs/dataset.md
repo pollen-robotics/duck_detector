@@ -13,31 +13,48 @@ laptop and useless on a robot, and it is invisible unless the split is built to 
 So: **many short sessions beat one long one.** Change something between them — the room, the light,
 where the watching duck stands — and tag what changed.
 
+## Where a session comes from
+
+The robot's own stream. `capture` asks `mediad` for `media.stream` — the same call the vision-demo
+Space makes — and the robot dials a WebSocket on the laptop and pushes JPEG frames down it, off the
+tee that already feeds the console's video and the robot's own duck detector. `mediad` is never
+stopped and nothing is installed on the board; the frames are, by construction, the picture the
+detector will be handed at inference.
+
 ## What a session records
 
 ```json
 {
-  "session": "20260826T120000Z_kitchen_duck-c51b",
+  "session": "20260910T140000Z_kitchen_graphite",
   "tag": "kitchen",
-  "robot": "duck-c51b",
-  "serial": "bb7b734a7717ac41",
+  "robot": "graphite",
+  "serial": "cec2b3808a7238ff",
   "frames": 240,
   "hz": 2.0,
-  "width": 1280, "height": 720,
-  "flip": "90r",
-  "release": "0.9.3",
-  "note": "two ducks, one walking"
+  "seconds": 120,
+  "width": 720, "height": 1280,
+  "rotate": 0,
+  "mount_rotate": 90,
+  "release": "0.9.4",
+  "note": "two ducks, one walking",
+  "transport": "media.stream",
+  "longest": 1280, "quality": 90,
+  "hello": { "...the robot's own description of the stream..." }
 }
 ```
 
-`flip` is the one that will cause an afternoon of confusion if it is ever wrong: the robot turns
-the picture a quarter turn before anything sees it (`mediad --rotate`, default 90°), so the dataset
-is captured through the same turn. A session captured with `--flip identity` is not wrong, it is a
-different domain — and mixing the two silently trains a detector for neither.
+`rotate` and `mount_rotate` are the ones that would cause an afternoon of confusion if they were
+ever wrong. The robot turns the picture by the mount angle (`mediad --rotate`, default 90°) before
+its tee, so the frames arrive **upright** and the hello says `rotate: 0` about them — a session with
+anything else there is a different domain, and mixing the two silently trains a detector for
+neither. `hello` is kept whole because it is the robot's own account of what it sent.
 
 `robot` and `serial` matter because the cameras are not identical: same module, different
 mounting, and eventually a different board. A model that only ever saw one robot's camera is worth
 knowing about.
+
+Sessions from before September 2026 were captured over ssh with `mediad` stopped and carry `flip:
+"90r"` instead — the same upright picture by a different route, and the same domain.
 
 ## What to capture
 
@@ -55,12 +72,17 @@ Roughly in order of what it buys:
 The shells come in **blue, white and grey**, so colour is not a cue and nothing in this pipeline
 treats it as one.
 
-## Layout
+## Layout, here and on the Hub
 
 ```
 datasets/
-  raw/<session>/frame_00001.jpg …   session.json
-  labelled/<session>/                YOLO-format .txt beside each frame
+  raw/<session>/frame_00000.jpg …   session.json     ─┐
+  labelled/<session>/frame_*.txt    labels.json       ├─ mirrored on the Hub
+  reviewed/<session>/frame_*.txt                     ─┘
+  review/<session>/                 Label Studio's tasks — scratch
+  yolo/                             what `dataset build` assembles — scratch
 ```
 
-Neither is in git — a session is tens of megabytes of JPEG. The repo carries the recipe.
+None of it is in git. The three data directories are the tree of the dataset repo
+`pollen-robotics/microduck-duck-detector-dataset`: `uv run dataset push` sends what the Hub does not have
+(frames once, corrections every time they change) and `uv run dataset pull` brings it all down.

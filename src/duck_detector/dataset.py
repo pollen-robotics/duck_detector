@@ -6,8 +6,17 @@ on both sides: the val score then measures memorisation, comes out high, and the
 the robot for reasons the numbers never showed. Whole sessions go to one side or the other.
 
     uv run dataset build                          # every reviewed session, newest held out
-    uv run dataset build --val <session> ...      # or name them
+    uv run dataset build --val <session> ...      # or name what is held out
+    uv run dataset build --tag kitchen --tag hall # only sessions with these tags
+    uv run dataset build --sessions <a> <b> ...   # or name the sessions themselves
+    uv run dataset build --exclude <session> ...  # everything but these
     uv run dataset build --smoke                  # one session, split by frame, for plumbing only
+
+One dataset from many sessions is the normal case, and the selection is the other half of the
+split: which rooms, which robots and which days are in a model is what `build.json` records, and
+`train --push` carries that record onto the Hub beside the weights.
+    uv run dataset push [session ...]             # sessions to the Hub, see hub.py
+    uv run dataset pull [session ...]             # and back
 
 Images are symlinked rather than copied: the frames stay the one copy in `datasets/raw/`, and a
 rebuild costs nothing.
@@ -33,6 +42,7 @@ class Labelled:
     session: str
     frames: list[tuple[Path, Path]]  # (image, label)
     reviewed: bool
+    tag: str | None = None
 
     @property
     def boxes(self) -> int:
@@ -40,6 +50,41 @@ class Labelled:
             len([line for line in label.read_text().splitlines() if line.strip()])
             for _, label in self.frames
         )
+
+
+def select(
+    sessions: list[Labelled],
+    *,
+    names: list[str] | None = None,
+    tags: list[str] | None = None,
+    exclude: list[str] | None = None,
+) -> list[Labelled]:
+    """The sessions a build is made of: all of them unless named, tagged, or excluded.
+
+    A name matches a session exactly; a tag matches the `tag` field of its `session.json`, so
+    `--tag kitchen` gets every kitchen session whatever day it was shot. Names and tags widen the
+    selection; exclusions narrow it afterwards.
+    """
+    chosen = sessions
+    if names or tags:
+        wanted = set(names or [])
+        chosen = [s for s in chosen if s.session in wanted or s.tag in set(tags or [])]
+        missing = wanted - {s.session for s in chosen}
+        if missing:
+            raise SystemExit(f"no labelled session called: {', '.join(sorted(missing))}")
+    if exclude:
+        chosen = [s for s in chosen if s.session not in set(exclude)]
+    return chosen
+
+
+def session_tag(session: str) -> str | None:
+    record = DATASETS / "raw" / session / "session.json"
+    if not record.exists():
+        return None
+    try:
+        return json.loads(record.read_text()).get("tag")
+    except ValueError:
+        return None
 
 
 def find(source: str) -> list[Labelled]:
@@ -56,7 +101,14 @@ def find(source: str) -> list[Labelled]:
                 if image.exists():
                     pairs.append((image, label))
             if pairs:
-                found.append(Labelled(directory.name, pairs, reviewed=kind == "reviewed"))
+                found.append(
+                    Labelled(
+                        directory.name,
+                        pairs,
+                        reviewed=kind == "reviewed",
+                        tag=session_tag(directory.name),
+                    )
+                )
     return found
 
 
@@ -100,6 +152,7 @@ def build(sessions: list[Labelled], val: set[str], smoke: bool) -> dict:
         "sessions": [
             {
                 "session": s.session,
+                "tag": s.tag,
                 "frames": len(s.frames),
                 "boxes": s.boxes,
                 "reviewed": s.reviewed,
@@ -118,19 +171,45 @@ def main() -> None:
     b = sub.add_parser("build")
     b.add_argument("--source", default="auto", choices=["auto", "reviewed", "labelled"])
     b.add_argument("--val", nargs="*", default=[], help="sessions to hold out; default the newest")
+    b.add_argument("--sessions", nargs="*", default=[], help="only these sessions; default all")
+    b.add_argument("--tag", action="append", default=[], help="only sessions with this tag")
+    b.add_argument("--exclude", nargs="*", default=[], help="leave these sessions out")
     b.add_argument(
         "--smoke",
         action="store_true",
         help="allow a single session, split by frame — plumbing only, never a number to quote",
     )
+    push = sub.add_parser("push", help="upload sessions to the Hub; default every local one")
+    push.add_argument("sessions", nargs="*")
+    push.add_argument("--force", action="store_true", help="resend frames the Hub already has")
+    push.add_argument("--public", action="store_true", help="create the repo public, if creating")
+    pull = sub.add_parser("pull", help="download sessions from the Hub; default all of them")
+    pull.add_argument("sessions", nargs="*")
+    for p in (push, pull):
+        p.add_argument("--repo", default=None, help="dataset repo; default from hub.py")
     args = parser.parse_args()
+
+    if args.command in ("push", "pull"):
+        from duck_detector import hub
+
+        repo = args.repo or hub.DATASET_REPO
+        if args.command == "push":
+            hub.push_sessions(
+                args.sessions or None, repo=repo, private=not args.public, force=args.force
+            )
+        else:
+            hub.pull_sessions(args.sessions or None, repo=repo)
+        return
 
     sessions = find(args.source)
     if not sessions:
         raise SystemExit(
-            "no labelled sessions. `uv run autolabel datasets/raw/<session>` writes the "
-            "pre-labels, `uv run review` corrects them."
+            "no labelled sessions. `uv run dataset pull` fetches the ones on the Hub; "
+            "`uv run review datasets/raw/<session>` corrects a new one."
         )
+    sessions = select(sessions, names=args.sessions, tags=args.tag, exclude=args.exclude)
+    if not sessions:
+        raise SystemExit("the selection left no sessions")
     unreviewed = [s.session for s in sessions if not s.reviewed]
     if unreviewed:
         print(

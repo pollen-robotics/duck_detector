@@ -3,6 +3,7 @@
     uv sync --extra train
     uv run train                      # yolo11n at 320, on datasets/yolo
     uv run train --export             # and write the ONNX the RKNN conversion takes
+    uv run train --export --push      # and put the run on the Hub, tagged with its name
 
 Choices worth knowing, all of them driven by what the first session's frames look like:
 
@@ -39,6 +40,7 @@ def main() -> None:
     parser.add_argument("--name", default="duck", help="run name under runs/")
     parser.add_argument("--device", default=None, help="cuda index, or cpu")
     parser.add_argument("--export", action="store_true", help="write ONNX when training finishes")
+    parser.add_argument("--push", action="store_true", help="upload the run to the Hub after")
     args = parser.parse_args()
 
     if not args.data.exists():
@@ -105,6 +107,14 @@ def main() -> None:
         "smoke": "SMOKE" in header,
     }
     run = Path(model.trainer.save_dir)
+    build = args.data.parent / "build.json"
+    if build.exists():
+        # Which sessions, and which side of the split each was on: the provenance of the number
+        # above, and what `model push` puts on the Hub beside the weights.
+        built = json.loads(build.read_text())
+        summary["sessions"] = [s["session"] for s in built["sessions"]]
+        summary["val_sessions"] = [s["session"] for s in built["sessions"] if s["split"] == "val"]
+        (run / "build.json").write_text(json.dumps(built, indent=2) + "\n")
     (run / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     summary["run"] = str(run)
     print(json.dumps(summary, indent=2))
@@ -122,6 +132,11 @@ def main() -> None:
             "drawn from datasets/raw), then measure it on the board — quantisation is where a\n"
             "detector that worked on the laptop stops working."
         )
+
+    if args.push:
+        from duck_detector import hub
+
+        hub.push_model(run)
 
 
 if __name__ == "__main__":

@@ -134,3 +134,30 @@ def test_the_review_round_trip_keeps_the_boxes(tmp_path, monkeypatch):
     cx, cy, w, h = (float(v) for v in reviewed.joinpath("frame_00000.txt").read_text().split()[1:])
     assert (cx, cy, w, h) == pytest.approx((0.40, 0.50, 0.20, 0.30))
     assert reviewed.joinpath("frame_00001.txt").read_text() == "", "an empty frame is a negative"
+
+
+def test_one_dataset_is_built_from_the_sessions_chosen(tmp_path, monkeypatch):
+    """Many sessions, one dataset — and which ones is a choice, by name, by tag, or by exclusion."""
+    monkeypatch.chdir(tmp_path)
+    for name, tag in [
+        ("20260101T000000Z_a_duck", "kitchen"),
+        ("20260102T000000Z_b_duck", "hall"),
+        ("20260103T000000Z_c_duck", "kitchen"),
+    ]:
+        raw = make_session(tmp_path, name)
+        (raw / "session.json").write_text(json.dumps({"session": name, "tag": tag}))
+
+    monkeypatch.setattr(sys, "argv", ["dataset", "build", "--tag", "kitchen"])
+    dataset.main()
+    build = json.loads((tmp_path / "datasets/yolo/build.json").read_text())
+    assert [s["session"][-6:] for s in build["sessions"]] == ["a_duck", "c_duck"]
+    assert all(s["tag"] == "kitchen" for s in build["sessions"])
+
+    monkeypatch.setattr(sys, "argv", ["dataset", "build", "--exclude", "20260102T000000Z_b_duck"])
+    dataset.main()
+    build = json.loads((tmp_path / "datasets/yolo/build.json").read_text())
+    assert len(build["sessions"]) == 2
+
+    monkeypatch.setattr(sys, "argv", ["dataset", "build", "--sessions", "nope"])
+    with pytest.raises(SystemExit, match="no labelled session called"):
+        dataset.main()

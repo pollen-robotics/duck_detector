@@ -389,7 +389,7 @@ def _interrupt(*_: object) -> None:
     raise KeyboardInterrupt
 
 
-def run(session: Path, port: int, relabel: bool, open_browser: bool) -> None:
+def run(session: Path, port: int, relabel: bool, open_browser: bool, push: bool = False) -> None:
     signal.signal(signal.SIGTERM, _interrupt)
     tasks = ensure_prepared(session, relabel)
     creds = credentials()
@@ -456,8 +456,14 @@ def run(session: Path, port: int, relabel: bool, open_browser: bool) -> None:
         if pulled is not None:
             written, boxes = write_labels(pulled, session.name)
             print(f"== {written} frames reviewed, {boxes} boxes → {REVIEWED / session.name}")
-            if written:
-                print("   next: uv run dataset build   (with two sessions or more)")
+            if written and push:
+                from duck_detector import hub
+
+                hub.push_sessions([session.name])
+            elif written:
+                print(
+                    "   next: uv run dataset push, then uv run dataset build (two sessions or more)"
+                )
 
 
 def main() -> None:
@@ -469,6 +475,9 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--relabel", action="store_true", help="run the pre-labeller again")
     parser.add_argument("--no-open", action="store_true", help="do not open a browser")
+    parser.add_argument(
+        "--push", action="store_true", help="upload the corrections to the Hub after"
+    )
     parser.add_argument(
         "--import",
         dest="import_file",
@@ -485,7 +494,7 @@ def main() -> None:
         parser.error("give a session directory, or --import <export>.json")
     if not args.session.is_dir():
         raise SystemExit(f"no such session: {args.session}")
-    run(args.session, args.port, args.relabel, not args.no_open)
+    run(args.session, args.port, args.relabel, not args.no_open, args.push)
 
 
 if __name__ == "__main__":
