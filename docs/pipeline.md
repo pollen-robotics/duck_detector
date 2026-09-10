@@ -182,6 +182,34 @@ better than a blur transform would.
 run's `summary.json`, `results.csv` and `args.yaml` under `runs/<name>/`, and tags the commit with
 the run's name.
 
+### watch — the review before the push
+
+```bash
+uv run watch runs/detect/duck --host 192.168.10.124    # live
+uv run watch runs/detect/duck --session                # the held-out session, offline
+```
+
+The val numbers come from frames the model was not trained on, but from the same rooms, the same
+day and the same two ducks. A detector that scores well there can still lose a duck against a
+window or find one in a chair leg the moment the camera looks somewhere new, and the only way to see
+that before the model is quantised and pushed is to point a robot at things and watch the boxes.
+
+**Live** opens the same session `capture` does (`media.stream`, JPEG, LAN), runs the model on each
+frame as it arrives — only the newest one; a queue would show the past — draws the boxes and serves
+the result as MJPEG at `localhost:8090`, where a browser opens. The stream runs at 5 fps and 640 px
+by default, which is what the robot's own detector sees.
+
+**Offline** runs the model over a captured session, writes a contact sheet and `predictions.json`
+under `datasets/predicted/<session>/`, and scores the boxes against the corrections at IoU 0.5 when
+there are any. `--session` alone takes the session the run held out, read from its `build.json`; a
+path names another one — a session captured after training is the most honest number there is.
+The first such number, duck-v1 on an office session it had never seen: 3 of 21 ducks found. Which
+is exactly why this step exists.
+
+The weights are the run's `best.onnx` when it exists, else `best.pt`, so what is reviewed is what
+gets quantised. ONNX runs on the CPU here, because onnxruntime's CUDA provider hits the cuDNN
+problem below.
+
 ### export
 
 ```bash

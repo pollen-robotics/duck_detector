@@ -35,6 +35,8 @@ import logging
 import socket
 import sys
 import time
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -99,11 +101,22 @@ def lan_address(probe: str = "1.1.1.1") -> str:
 
 
 class Receiver:
-    """The far end of `media.stream`: one hello, then a JPEG per message, written as they land."""
+    """The far end of `media.stream`: one hello, then a JPEG per message.
 
-    def __init__(self, directory: Path, *, limit: int | None = None):
+    Frames are written to `directory` when there is one, and handed to `on_frame` when there is
+    one — a capture wants the first, `watch` the second, and nothing stops a caller wanting both.
+    """
+
+    def __init__(
+        self,
+        directory: Path | None,
+        *,
+        limit: int | None = None,
+        on_frame: Callable[[bytes], None] | None = None,
+    ):
         self.directory = directory
         self.limit = limit
+        self.on_frame = on_frame
         self.hello: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self.done = asyncio.Event()
         self.frames = 0
@@ -138,10 +151,13 @@ class Receiver:
             now = time.monotonic()
             self.first_at = self.first_at or now
             self.last_at = now
-            (self.directory / f"frame_{self.frames:05d}.jpg").write_bytes(message)
+            if self.directory is not None:
+                (self.directory / f"frame_{self.frames:05d}.jpg").write_bytes(message)
+            if self.on_frame is not None:
+                self.on_frame(message)
             self.frames += 1
             self.bytes += len(message)
-            if self.frames % 10 == 0:
+            if self.frames % 10 == 0 and self.directory is not None:
                 rate = (self.frames - 1) / max(now - self.first_at, 1e-6)
                 print(f"   {self.frames} frames, {rate:.1f}/s", file=sys.stderr, end="\r")
             if self.limit is not None and self.frames >= self.limit:
@@ -156,31 +172,32 @@ def image_size(path: Path) -> tuple[int, int]:
         return image.width, image.height
 
 
-async def run(args: argparse.Namespace, lane: robot.Lane, out: dict) -> Path:
+@asynccontextmanager
+async def streaming(
+    lane: robot.Lane,
+    receiver: Receiver,
+    *,
+    port: int = DEFAULT_PORT,
+    advertise: str | None = None,
+    hz: float = 2.0,
+    longest: int = DEFAULT_LONGEST,
+    quality: int = 90,
+) -> AsyncIterator[dict[str, Any]]:
+    """Serve the receiver, ask the robot to stream to it, yield the hello, then stop the stream.
+
+    **The stream is stopped whatever happens inside**, including Ctrl-C: a robot left streaming
+    JPEGs at a laptop that has gone is a robot spending a core on nobody, and redialling every 30 s
+    until somebody notices. The robot's counters are printed first: `sent` against what arrived
+    here is the one number that says which side lost the frames.
+    """
     from websockets.asyncio.server import serve
 
-    duck = lane.producer
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    session = f"{stamp}_{args.tag}_{duck.name}"
-    local_dir = Path(args.root) / session
-    local_dir.mkdir(parents=True, exist_ok=True)
-    # Handed back through `out` rather than returned: a Ctrl-C cancels this task, and `asyncio.run`
-    # then re-raises `KeyboardInterrupt` after it has finished — the return value never arrives.
-    out["dir"] = local_dir
-
-    limit = round(args.hz * args.seconds) if args.seconds else None
-    receiver = Receiver(local_dir, limit=limit)
-    advertise = args.advertise or lan_address()
-    request = {
-        "url": f"ws://{advertise}:{args.port}/frames",
-        "encoding": "jpeg",
-        "fps": args.hz,
-        "longest": args.longest,
-        "quality": args.quality,
-    }
-    print(f"== {session}: {args.seconds or '∞'}s at {args.hz} Hz from {duck.name}", file=sys.stderr)
-
-    async with serve(receiver.handle, "0.0.0.0", args.port):
+    url = f"ws://{advertise or lan_address()}:{port}/frames"
+    request = {"url": url, "encoding": "jpeg", "fps": hz, "longest": longest, "quality": quality}
+    # `max_size=None`: the library's default caps a message at 1 MiB and closes the socket over
+    # a bigger one, and a full-resolution JPEG from a robot on the LAN is not an attack.
+    async with serve(receiver.handle, "0.0.0.0", port, max_size=None):
+        started = time.monotonic()
         answer = await lane.call("media.stream", request)
         print(f"== media.stream accepted: {json.dumps(answer)}", file=sys.stderr)
         try:
@@ -189,7 +206,7 @@ async def run(args: argparse.Namespace, lane: robot.Lane, out: dict) -> Path:
             except TimeoutError:
                 status = await lane.call("media.stream")
                 raise robot.RobotError(
-                    f"the robot accepted the stream and never dialled {request['url']} "
+                    f"the robot accepted the stream and never dialled {url} "
                     f"(its view: {json.dumps(status)}). It has to reach this laptop: same "
                     "network, no firewall on the port, and --advertise <ip> if the address "
                     "above is not the one it should use."
@@ -201,22 +218,57 @@ async def run(args: argparse.Namespace, lane: robot.Lane, out: dict) -> Path:
                 f"longest {frames.get('longest')}, {frames.get('fps')} fps",
                 file=sys.stderr,
             )
-            # Stopped by the frame count when there is one, else by Ctrl-C. `wait_for` on the
-            # event rather than a sleep, so a slow robot still delivers `--seconds` worth.
-            if limit is None:
-                await receiver.done.wait()
-            else:
-                await asyncio.wait_for(receiver.done.wait(), timeout=args.seconds * 2 + 30)
-        except (asyncio.CancelledError, KeyboardInterrupt, TimeoutError):
-            print("\n== stopping", file=sys.stderr)
+            yield hello
+        except (asyncio.CancelledError, KeyboardInterrupt, TimeoutError) as why:
+            elapsed = time.monotonic() - started
+            print(
+                f"\n== stopping after {elapsed:.0f}s "
+                f"({'no more frames came' if isinstance(why, TimeoutError) else 'interrupted'})",
+                file=sys.stderr,
+            )
         finally:
-            # **The stream is stopped whatever happened above**, including Ctrl-C: a robot left
-            # streaming JPEGs at a laptop that has gone is a robot spending a core on nobody, and
-            # redialling every 30 s until somebody notices.
             try:
+                status = await lane.call("media.stream")
+                print(
+                    f"== the robot's view: sent {status.get('sent')}, dropped "
+                    f"{status.get('dropped')}, connected {status.get('connected')}; "
+                    f"{receiver.frames} arrived here",
+                    file=sys.stderr,
+                )
                 await lane.call("media.stream", {"url": None})
             except (robot.RobotError, robot.RpcError) as e:
                 print(f"== could not stop the stream: {e}", file=sys.stderr)
+
+
+async def run(args: argparse.Namespace, lane: robot.Lane, out: dict) -> Path:
+    duck = lane.producer
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    session = f"{stamp}_{args.tag}_{duck.name}"
+    local_dir = Path(args.root) / session
+    local_dir.mkdir(parents=True, exist_ok=True)
+    # Handed back through `out` rather than returned: a Ctrl-C cancels this task, and `asyncio.run`
+    # then re-raises `KeyboardInterrupt` after it has finished — the return value never arrives.
+    out["dir"] = local_dir
+
+    limit = round(args.hz * args.seconds) if args.seconds else None
+    receiver = Receiver(local_dir, limit=limit)
+    print(f"== {session}: {args.seconds or '∞'}s at {args.hz} Hz from {duck.name}", file=sys.stderr)
+
+    async with streaming(
+        lane,
+        receiver,
+        port=args.port,
+        advertise=args.advertise,
+        hz=args.hz,
+        longest=args.longest,
+        quality=args.quality,
+    ):
+        # Stopped by the frame count when there is one, else by Ctrl-C. `wait_for` on the event
+        # rather than a sleep, so a slow robot still delivers `--seconds` worth.
+        if limit is None:
+            await receiver.done.wait()
+        else:
+            await asyncio.wait_for(receiver.done.wait(), timeout=args.seconds * 2 + 30)
 
     print(file=sys.stderr)
     if receiver.frames == 0:

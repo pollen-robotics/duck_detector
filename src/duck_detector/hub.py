@@ -41,6 +41,10 @@ WEIGHTS = Path("weights")
 MODEL_STEM = "duck_detect"
 MODEL_FILES = ("best.pt", "best.onnx", "best.rknn")
 RUN_FILES = ("summary.json", "build.json", "results.csv", "args.yaml")
+# Derived, for looking at rather than for training, and never pushed: the Hub's dataset viewer
+# guesses an image-folder layout from whatever pictures it finds, and three contact sheets labelled
+# by directory name made it show three rows and none of the frames. `autolabel --sheet` remakes one.
+SCRATCH_FILES = ("sheet.png",)
 
 
 def api():
@@ -120,7 +124,7 @@ def push_sessions(
             local = {
                 prefix + path.relative_to(directory).as_posix(): path
                 for path in directory.rglob("*")
-                if path.is_file()
+                if path.is_file() and path.name not in SCRATCH_FILES
             }
             for stale in sorted(p for p in on_hub if p.startswith(prefix) and p not in local):
                 operations.append(CommitOperationDelete(path_in_repo=stale))
@@ -190,6 +194,11 @@ tags:
   - robotics
   - microduck
 pretty_name: Microduck duck detector
+configs:
+  - config_name: frames
+    data_files:
+      - split: train
+        path: raw/*/frame_*.jpg
 ---
 
 # Microducks, seen by a Microduck

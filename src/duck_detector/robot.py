@@ -41,6 +41,39 @@ CONNECT_TIMEOUT = 20.0
 CONTROL_LABEL = "control"
 
 
+def patch_dtls_ciphers() -> None:
+    """Add a DTLS cipher GStreamer's `webrtcsink` accepts to aiortc's list.
+
+    **Without this, ICE completes and the channel never opens.** aiortc's default cipher list
+    shares no cipher with the robot's `webrtcsink`, so the DTLS handshake fails silently after a
+    successful ICE — a failure that looks exactly like a firewall and is not one. The same shim
+    `reachy_mini.media.central_consumer` applies, written here so this repo does not depend on
+    theirs for five lines. Upstream: aiortc PR #1392; drop this once a release negotiates a common
+    cipher by default. Idempotent.
+    """
+    from aiortc.rtcdtlstransport import RTCCertificate
+
+    if getattr(RTCCertificate, "_duck_cipher_patched", False):
+        return
+    original = RTCCertificate._create_ssl_context
+    ciphers = (
+        b"ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:"
+        b"ECDHE-ECDSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA:"
+        b"ECDHE-RSA-AES128-GCM-SHA256"
+    )
+
+    def patched(self, *args, **kwargs):
+        context = original(self, *args, **kwargs)
+        try:
+            context.set_cipher_list(ciphers)
+        except Exception as e:  # noqa: BLE001 - a context that will not take it still works
+            logger.warning("could not extend the DTLS cipher list: %r", e)
+        return context
+
+    RTCCertificate._create_ssl_context = patched
+    RTCCertificate._duck_cipher_patched = True
+
+
 class RobotError(Exception):
     """Something the person at the keyboard can act on."""
 
@@ -120,6 +153,10 @@ class Lane:
         self._ids = itertools.count(1)
         self._pending: dict[int, tuple[str, asyncio.Future]] = {}
         self._pump: asyncio.Task | None = None
+        # Candidates that arrive before the offer — ordinary trickle, held until there is a
+        # remote description to add them to.
+        self._early_ice: list[dict[str, Any]] = []
+        self._remote_set = False
 
     @property
     def url(self) -> str:
@@ -131,6 +168,7 @@ class Lane:
         from aiortc import RTCPeerConnection
         from websockets.asyncio.client import connect
 
+        patch_dtls_ciphers()
         loop = asyncio.get_running_loop()
         self._channel_open = loop.create_future()
         try:
@@ -161,6 +199,8 @@ class Lane:
             self._pc = RTCPeerConnection()
             self._pc.on("datachannel", self._on_datachannel)
             self._pc.on("track", self._on_track)
+            for state in ("connectionstatechange", "iceconnectionstatechange"):
+                self._pc.on(state, self._log_state)
             await self._send({"type": "startSession", "peerId": self.producer.peer_id})
             started = await self._expect("sessionStarted", also=("sessionRejected", "error"))
             if started.get("type") != "sessionStarted":
@@ -176,9 +216,10 @@ class Lane:
                 await asyncio.wait_for(asyncio.shield(self._channel_open), CONNECT_TIMEOUT)
             except TimeoutError:
                 raise RobotError(
-                    "the session opened and the control channel never did. ICE failed between "
-                    f"this machine and {self.host}: a firewall, or two networks that route to "
-                    "each other but not for UDP."
+                    "the session opened and the control channel never did "
+                    f"(ice {self._pc.iceConnectionState}, connection {self._pc.connectionState}). "
+                    "ICE failed is a firewall or two networks that do not route UDP; ICE completed "
+                    "and connection failed is DTLS — `journalctl -u mediad -b` on the robot."
                 ) from None
             return self
         except BaseException:
@@ -253,8 +294,6 @@ class Lane:
 
     async def _read_signalling(self) -> None:
         """After the session: offers and candidates in, answers and candidates out."""
-        from aiortc.sdp import candidate_from_sdp
-
         try:
             while True:
                 message = json.loads(await self._ws.recv())
@@ -262,10 +301,10 @@ class Lane:
                 if kind == "peer" and message.get("sdp"):
                     await self._answer(message["sdp"])
                 elif kind == "peer" and message.get("ice"):
-                    ice = message["ice"]
-                    candidate = candidate_from_sdp(ice["candidate"].removeprefix("candidate:"))
-                    candidate.sdpMLineIndex = ice.get("sdpMLineIndex")
-                    await self._pc.addIceCandidate(candidate)
+                    if self._remote_set:
+                        await self._add_ice(message["ice"])
+                    else:
+                        self._early_ice.append(message["ice"])
                 elif kind == "endSession":
                     self.session_id = None
                     self._abandon("the robot ended the session")
@@ -279,6 +318,10 @@ class Lane:
         from aiortc import RTCSessionDescription
 
         await self._pc.setRemoteDescription(RTCSessionDescription(offer["sdp"], offer["type"]))
+        self._remote_set = True
+        early, self._early_ice = self._early_ice, []
+        for ice in early:
+            await self._add_ice(ice)
         answer = await self._pc.createAnswer()
         # `setLocalDescription` gathers ICE before it returns, so the answer carries every
         # candidate and nothing needs trickling from this side.
@@ -290,6 +333,28 @@ class Lane:
                 "sessionId": self.session_id,
                 "sdp": {"type": local.type, "sdp": local.sdp},
             }
+        )
+
+    async def _add_ice(self, ice: dict[str, Any]) -> None:
+        from aiortc.sdp import candidate_from_sdp
+
+        text = (ice.get("candidate") or "").strip()
+        if not text:
+            return  # end-of-candidates; aiortc wants nothing for it
+        try:
+            candidate = candidate_from_sdp(text.removeprefix("candidate:"))
+            candidate.sdpMid = ice.get("sdpMid")
+            if ice.get("sdpMLineIndex") is not None:
+                candidate.sdpMLineIndex = int(ice["sdpMLineIndex"])
+            await self._pc.addIceCandidate(candidate)
+        except Exception as e:  # noqa: BLE001 - one bad candidate is not a dead session
+            logger.warning("addIceCandidate failed: %r (%r)", e, text[:80])
+
+    def _log_state(self) -> None:
+        logger.info(
+            "peer connection: ice %s, connection %s",
+            self._pc.iceConnectionState,
+            self._pc.connectionState,
         )
 
     def _on_datachannel(self, channel) -> None:

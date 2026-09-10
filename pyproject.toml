@@ -52,6 +52,7 @@ dataset = "duck_detector.dataset:main"
 train = "duck_detector.train:main"
 agreement = "duck_detector.agreement:main"
 model = "duck_detector.model:main"
+watch = "duck_detector.watch:main"
 
 [tool.ruff]
 src = ["src"]

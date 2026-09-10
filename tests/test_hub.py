@@ -21,6 +21,10 @@ def make(root: Path, session: str, *, reviewed: bool) -> None:
         out = root / "reviewed" / session
         out.mkdir(parents=True)
         (out / "frame_00000.txt").write_text("0 0.5 0.5 0.2 0.3\n")
+    labelled = root / "labelled" / session
+    labelled.mkdir(parents=True)
+    (labelled / "frame_00000.txt").write_text("0 0.5 0.5 0.2 0.3\n")
+    (labelled / "sheet.png").write_bytes(b"png")
 
 
 def test_sessions_are_read_off_the_hub_listing():
@@ -78,9 +82,13 @@ def test_a_push_plans_new_frames_and_replaces_labels(tmp_path, monkeypatch):
     ) in paths
     assert ("CommitOperationAdd", "reviewed/20260101T000000Z_a_graphite/frame_00000.txt") in paths
     assert "reviewed (1 files)" in first_message
+    # The contact sheet is for looking at, and the Hub's viewer mistakes it for the dataset.
+    assert not any(p.endswith("sheet.png") for _, p in paths)
+    assert ("CommitOperationAdd", "labelled/20260101T000000Z_a_graphite/frame_00000.txt") in paths
 
     second_message, second_ops = commits[1]
     assert sorted(op.path_in_repo for op in second_ops) == [
+        "labelled/20260102T000000Z_b_graphite/frame_00000.txt",
         "raw/20260102T000000Z_b_graphite/frame_00000.jpg",
         "raw/20260102T000000Z_b_graphite/session.json",
     ]
